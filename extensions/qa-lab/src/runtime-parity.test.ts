@@ -2,20 +2,24 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
+import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { resolveStorePath, upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import { appendSessionTranscriptMessageByIdentity } from "openclaw/plugin-sdk/session-transcript-runtime";
 import {
   appendSqliteTrajectoryRuntimeEvents,
+  closeOpenClawAgentDatabasesAsync,
+  closeOpenClawAgentDatabasesForTest,
+  closeOpenClawStateDatabaseAsync,
   formatSqliteSessionFileMarker,
 } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stableHash } from "./parity-shared.js";
+import type { RuntimeId } from "./runtime-id.js";
 import {
   captureRuntimeParityCell,
   isRuntimeParityResultPass,
   resolveRuntimeParityUsagePolicy,
   runRuntimeParityScenario,
-  type RuntimeId,
   type RuntimeParityCell,
   type RuntimeParityToolCall,
 } from "./runtime-parity.js";
@@ -25,6 +29,12 @@ const tempDirs = createTempDirHarness();
 
 afterEach(async () => {
   vi.unstubAllGlobals();
+  // Join worker cleanup before removing its databases. Agent lease release can reopen
+  // shared state, so drain agent resources first and shared state second.
+  await closeOpenClawAgentDatabasesAsync();
+  closeOpenClawAgentDatabasesForTest();
+  await closeOpenClawStateDatabaseAsync();
+  resetPluginStateStoreForTests();
   await tempDirs.cleanup();
 });
 
@@ -142,6 +152,38 @@ async function captureRuntimeParityWithMockRequests(params: {
   }
 }
 
+function createTerminalImageParityInput(
+  stepStatus: "pass" | "fail",
+  details: string,
+): Parameters<typeof captureRuntimeParityWithMockRequests>[0] {
+  return {
+    requests: [{ plannedToolName: "image_generate", plannedToolArgs: { prompt: "same" } }],
+    messages: [
+      { role: "user", content: "Generate the QA image." },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "image-call",
+            name: "image_generate",
+            arguments: { prompt: "same" },
+          },
+        ],
+      },
+    ],
+    scenarioResult: {
+      status: "pass",
+      steps: [
+        {
+          status: stepStatus,
+          details,
+        },
+      ],
+    },
+  };
+}
+
 function makeRuntimeParityCell(
   runtime: RuntimeId,
   toolCalls: RuntimeParityToolCall[],
@@ -220,6 +262,17 @@ describe("runtime parity", () => {
           toolName: "image_generate",
           content: [{ type: "text", text: "Image generation started" }],
         },
+        {
+          role: "assistant",
+          content: [
+            "  plain  ",
+            { type: "output_text", content: "nested" },
+            { type: "message", content: "message" },
+            { type: "unknown", text: " priority ", content: "ignored" },
+            { type: "toolResult", content: "ignored tool result" },
+            { type: "Output_Text", content: "ignored normalized type" },
+          ],
+        },
       ],
     });
 
@@ -234,6 +287,7 @@ describe("runtime parity", () => {
     expect(cell.toolCalls).toHaveLength(1);
     expect(cell.toolCalls[0]).toMatchObject({ tool: "image_generate" });
     expect(cell.toolCalls[0]?.errorClass).toBeUndefined();
+    expect(cell.finalText).toBe("plain nested message priority");
   });
 
   it("captures native tool execution from the canonical SQLite trajectory", async () => {
@@ -616,19 +670,6 @@ describe("runtime parity", () => {
     expect(cell.runtimeErrorClass).toBe("timeout");
   });
 
-  it("keeps planned mock calls diagnostic instead of promoting them to runtime calls", async () => {
-    const cell = await captureRuntimeParityWithMockRequests({
-      requests: [{ plannedToolName: "read_file", plannedToolArgs: { path: "README.md" } }],
-    });
-
-    expect(cell.toolCalls).toEqual([]);
-    expect(cell.providerPlanToolCalls).toHaveLength(1);
-    expect(cell.providerPlanToolCalls?.[0]).toMatchObject({
-      tool: "read_file",
-      errorClass: "tool-result-missing",
-    });
-  });
-
   it("records resolved mock calls as provider-plan evidence", async () => {
     const cell = await captureRuntimeParityWithMockRequests({
       requests: [
@@ -638,13 +679,18 @@ describe("runtime parity", () => {
     });
 
     expect(cell.toolCalls).toEqual([]);
-    expect(cell.providerPlanToolCalls).toHaveLength(1);
-    expect(cell.providerPlanToolCalls?.[0]?.errorClass).toBeUndefined();
+    expect(cell.providerPlanToolCalls).toEqual([
+      {
+        tool: "read_file",
+        argsHash: stableHash({ path: "README.md" }),
+        resultHash: stableHash({ ok: true }),
+      },
+    ]);
 
     const result = await runRuntimeParityScenario({
       scenarioId: "resolved-tool",
       runCell: async (runtime) => ({
-        scenarioStatus: "pass",
+        status: "pass",
         cell: { ...cell, runtime },
       }),
     });
@@ -663,7 +709,7 @@ describe("runtime parity", () => {
         reason: " Local fixture only; no assistant turn runs. ",
       },
       runCell: async (runtime) => ({
-        scenarioStatus: "pass",
+        status: "pass",
         cell: makeRuntimeParityCell(runtime, []),
       }),
     });
@@ -688,10 +734,17 @@ describe("runtime parity", () => {
       requests: [{ plannedToolName: "read_file", plannedToolArgs: { path: "README.md" } }],
     });
 
+    expect(cell.toolCalls).toEqual([]);
+    expect(cell.providerPlanToolCalls).toHaveLength(1);
+    expect(cell.providerPlanToolCalls?.[0]).toMatchObject({
+      tool: "read_file",
+      errorClass: "tool-result-missing",
+    });
+
     const result = await runRuntimeParityScenario({
       scenarioId: "planned-only-tool",
       runCell: async (runtime) => ({
-        scenarioStatus: "pass",
+        status: "pass",
         cell: { ...cell, runtime },
       }),
     });
@@ -704,7 +757,7 @@ describe("runtime parity", () => {
     const result = await runRuntimeParityScenario({
       scenarioId: "matching-tool-errors",
       runCell: async (runtime) => ({
-        scenarioStatus: "pass",
+        status: "pass",
         cell: {
           ...makeRuntimeParityCell(runtime, [
             {
@@ -727,7 +780,7 @@ describe("runtime parity", () => {
     const result = await runRuntimeParityScenario({
       scenarioId: "failed-cell-with-drift",
       runCell: async (runtime) => ({
-        scenarioStatus: runtime === "codex" ? "fail" : "pass",
+        status: runtime === "codex" ? "fail" : "pass",
         cell: makeRuntimeParityCell(runtime, [
           {
             tool: "web_search",
@@ -740,7 +793,7 @@ describe("runtime parity", () => {
 
     expect(result).toMatchObject({
       drift: "failure-mode",
-      driftDetails: "scenario status differs (pass vs fail)",
+      driftDetails: "runtime-pair cell status differs (pass vs fail)",
     });
     expect(isRuntimeParityResultPass(result)).toBe(false);
   });
@@ -774,37 +827,6 @@ describe("runtime parity", () => {
     });
 
     expect(cell.toolCalls).toEqual([expect.objectContaining({ tool: "image_generate" })]);
-    expect(cell.toolCalls[0]?.errorClass).toBeUndefined();
-  });
-
-  it("accepts a fresh scenario MEDIA result for terminal image tools", async () => {
-    const cell = await captureRuntimeParityWithMockRequests({
-      requests: [{ plannedToolName: "image_generate", plannedToolArgs: { prompt: "same" } }],
-      messages: [
-        { role: "user", content: "Generate the QA image." },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "image-call",
-              name: "image_generate",
-              arguments: { prompt: "same" },
-            },
-          ],
-        },
-      ],
-      scenarioResult: {
-        status: "pass",
-        steps: [
-          {
-            status: "pass",
-            details: "QA-CAPABILITY-1234\nimage_generate=true\nMEDIA:/tmp/qa-image.png",
-          },
-        ],
-      },
-    });
-
     expect(cell.toolCalls[0]?.errorClass).toBeUndefined();
   });
 
@@ -844,79 +866,18 @@ describe("runtime parity", () => {
   });
 
   it("requires call-linked passed step evidence for terminal image results", async () => {
-    const proven = await captureRuntimeParityWithMockRequests({
-      requests: [{ plannedToolName: "image_generate", plannedToolArgs: { prompt: "same" } }],
-      messages: [
-        { role: "user", content: "Generate the QA image." },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "image-call",
-              name: "image_generate",
-              arguments: { prompt: "same" },
-            },
-          ],
-        },
-      ],
-      scenarioResult: {
-        status: "pass",
-        steps: [
-          {
-            status: "pass",
-            details: "QA-CAPABILITY-1234\nimage_generate=true\nMEDIA:/tmp/qa-image.png",
-          },
-        ],
-      },
-    });
-    const unrelated = await captureRuntimeParityWithMockRequests({
-      requests: [{ plannedToolName: "image_generate", plannedToolArgs: { prompt: "same" } }],
-      messages: [
-        { role: "user", content: "Generate the QA image." },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "image-call",
-              name: "image_generate",
-              arguments: { prompt: "same" },
-            },
-          ],
-        },
-      ],
-      scenarioResult: {
-        status: "pass",
-        steps: [{ status: "pass", details: "MEDIA:/tmp/unrelated-screenshot.png" }],
-      },
-    });
-    const failed = await captureRuntimeParityWithMockRequests({
-      requests: [{ plannedToolName: "image_generate", plannedToolArgs: { prompt: "same" } }],
-      messages: [
-        { role: "user", content: "Generate the QA image." },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "toolCall",
-              id: "image-call",
-              name: "image_generate",
-              arguments: { prompt: "same" },
-            },
-          ],
-        },
-      ],
-      scenarioResult: {
-        status: "pass",
-        steps: [
-          {
-            status: "fail",
-            details: "image_generate=true\nMEDIA:/tmp/failed-image.png",
-          },
-        ],
-      },
-    });
+    const proven = await captureRuntimeParityWithMockRequests(
+      createTerminalImageParityInput(
+        "pass",
+        "QA-CAPABILITY-1234\nimage_generate=true\nMEDIA:/tmp/qa-image.png",
+      ),
+    );
+    const unrelated = await captureRuntimeParityWithMockRequests(
+      createTerminalImageParityInput("pass", "MEDIA:/tmp/unrelated-screenshot.png"),
+    );
+    const failed = await captureRuntimeParityWithMockRequests(
+      createTerminalImageParityInput("fail", "image_generate=true\nMEDIA:/tmp/failed-image.png"),
+    );
 
     expect(proven.toolCalls[0]?.errorClass).toBeUndefined();
     expect(unrelated.toolCalls[0]?.errorClass).toBe("tool-result-missing");
@@ -1044,5 +1005,18 @@ describe("runtime parity", () => {
       undefined,
       "tool-result-missing",
     ]);
+  });
+
+  it("copies model-switch evidence into the runtime parity cell", async () => {
+    const modelSwitchEvidence = {
+      primary: { runId: "run-1", responseModel: "primary-model" },
+      alternate: { runId: "run-2", responseModel: "alternate-model" },
+    };
+    const cell = await captureRuntimeParityWithMockRequests({
+      requests: [],
+      scenarioResult: { status: "pass", modelSwitchEvidence },
+    });
+
+    expect(cell.modelSwitchEvidence).toEqual(modelSwitchEvidence);
   });
 });

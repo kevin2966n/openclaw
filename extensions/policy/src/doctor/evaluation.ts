@@ -1,3 +1,4 @@
+import { resolveExecApprovalsDisplayPath } from "openclaw/plugin-sdk/exec-approvals-runtime";
 import type { HealthCheckContext, HealthFinding } from "openclaw/plugin-sdk/health";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { policyRoutingRules } from "../policy-routing.js";
@@ -16,9 +17,10 @@ import { CHECK_IDS, POLICY_CHECK_IDS } from "./check-ids.js";
 import { dataHandlingFindings, secretAuthProvenanceFindings } from "./data-auth-findings.js";
 import { execApprovalsFindings } from "./exec-approval-findings.js";
 import { ingressFindings } from "./ingress-findings.js";
+import { createOrderedPolicyShape } from "./ordered-shape.js";
 import { SUPPORTED_TOOL_METADATA } from "./policy-constants.js";
+import { policyEvidenceFinding } from "./policy-evidence-finding.js";
 import {
-  execApprovalsDisplayName,
   parsePolicyFile,
   policyChecksEnabled,
   policyDisplayName,
@@ -187,36 +189,45 @@ async function evaluatePolicyUncached(ctx: HealthCheckContext): Promise<PolicyEv
       ? policyRoutingRules(policy)
       : undefined;
   const execApprovalsFile = includeExecApprovals ? await readExecApprovalsFile(ctx) : undefined;
+  const evidenceOptions = {
+    includeIngress,
+    includeGatewayExposure,
+    includeAgentWorkspace,
+    includeDataHandling,
+    includeToolPosture: policyHasToolPostureRules(policy),
+    includeSandboxPosture,
+    includeSecrets,
+    includeAuthProfiles,
+    includeExecApprovals,
+    execApprovalsRaw: includeExecApprovals ? (execApprovalsFile?.raw ?? null) : undefined,
+    routing,
+  };
+  let unmigratedToolsFinding: HealthFinding | undefined;
   if (requiredMetadata.size > 0) {
-    const toolsFile = await readWorkspaceFile(ctx, "TOOLS.md");
-    evidence = await collectPolicyEvidence(ctx.cfg as Record<string, unknown>, {
+    const [toolsFile, legacyToolsFile] = await Promise.all([
+      readWorkspaceFile(ctx, "AGENTS.md"),
+      readWorkspaceFile(ctx, "TOOLS.md"),
+    ]);
+    if (legacyToolsFile !== null) {
+      unmigratedToolsFinding = {
+        checkId: CHECK_IDS.policyUnmigratedToolsFile,
+        severity: "error",
+        message:
+          "TOOLS.md contains unmigrated governed tool declarations; run `openclaw doctor --fix` to migrate them into the AGENTS.md `## Tools` section before policy evaluation can pass.",
+        source: "policy",
+        path: "TOOLS.md",
+        target: "oc://TOOLS.md/tools",
+        requirement: `oc://${policyFile.ocDocName}/tools/requireMetadata`,
+        fixHint:
+          "Run `openclaw doctor --fix` to migrate TOOLS.md into the AGENTS.md `## Tools` section.",
+      };
+    }
+    evidence = collectPolicyEvidence(ctx.cfg as Record<string, unknown>, {
       toolsRaw: toolsFile?.raw ?? "",
-      includeIngress,
-      includeGatewayExposure,
-      includeAgentWorkspace,
-      includeDataHandling,
-      includeToolPosture: policyHasToolPostureRules(policy),
-      includeSandboxPosture,
-      includeSecrets,
-      includeAuthProfiles,
-      includeExecApprovals,
-      execApprovalsRaw: includeExecApprovals ? (execApprovalsFile?.raw ?? null) : undefined,
-      routing,
+      ...evidenceOptions,
     });
   } else {
-    evidence = collectPolicyEvidence(ctx.cfg as Record<string, unknown>, {
-      includeIngress,
-      includeGatewayExposure,
-      includeAgentWorkspace,
-      includeDataHandling,
-      includeToolPosture: policyHasToolPostureRules(policy),
-      includeSandboxPosture,
-      includeSecrets,
-      includeAuthProfiles,
-      includeExecApprovals,
-      execApprovalsRaw: includeExecApprovals ? (execApprovalsFile?.raw ?? null) : undefined,
-      routing,
-    });
+    evidence = collectPolicyEvidence(ctx.cfg as Record<string, unknown>, evidenceOptions);
   }
   const policyFindings: HealthFinding[] = [
     ...policyContainerShapeFindings(policy, policyFile.displayName, policyFile.ocDocName),
@@ -238,10 +249,11 @@ async function evaluatePolicyUncached(ctx: HealthCheckContext): Promise<PolicyEv
       policyFile.ocDocName,
       evidence,
       execApprovalsFile,
-      execApprovalsDisplayName(),
+      resolveExecApprovalsDisplayPath(),
     ),
     ...authMetadataRequirementFindings,
     ...metadataRequirementFindings,
+    ...(unmigratedToolsFinding === undefined ? [] : [unmigratedToolsFinding]),
   ];
   if (requiredMetadata.has("risk")) {
     policyFindings.push(...toolRiskFindings(policyFile.ocDocName, evidence));
@@ -302,7 +314,11 @@ export function findingsForCheck(
 }
 
 function hasPolicyValidationFinding(findings: readonly HealthFinding[]): boolean {
-  return findings.some((finding) => finding.checkId === CHECK_IDS.policyInvalidFile);
+  return findings.some(
+    (finding) =>
+      finding.checkId === CHECK_IDS.policyInvalidFile ||
+      finding.checkId === CHECK_IDS.policyUnmigratedToolsFile,
+  );
 }
 
 function channelFindings(
@@ -328,19 +344,14 @@ function channelFindings(
       return [];
     }
     return [
-      {
+      policyEvidenceFinding(channel, {
         checkId: CHECK_IDS.policyDeniedChannelProvider,
-        severity: "error",
         message: `Channel '${channel.id}' uses denied provider '${channel.provider}'.`,
-        source: "policy",
-        path: "openclaw config",
-        ocPath: channel.source,
-        target: channel.source,
         requirement: rule.requirement,
         fixHint:
           rule.reason ??
           "Disable this channel, remove it from config, or update the policy deny rule.",
-      },
+      }),
     ];
   });
 }
@@ -402,41 +413,18 @@ function toolMetadataRequirementFindings(
   policyPath: string,
   policyDocName: string,
 ): readonly HealthFinding[] {
-  if (!isRecord(policy) || !isRecord(policy.tools) || policy.tools.requireMetadata === undefined) {
-    return [];
-  }
-  if (!Array.isArray(policy.tools.requireMetadata)) {
-    return [
-      {
-        checkId: CHECK_IDS.policyInvalidFile,
-        severity: "error",
-        message: `${policyPath} tools.requireMetadata must be an array of metadata keys.`,
-        source: "policy",
-        path: policyPath,
-        target: `oc://${policyDocName}/tools/requireMetadata`,
-        fixHint: `Use supported metadata keys: ${SUPPORTED_TOOL_METADATA.join(", ")}.`,
-      },
-    ];
-  }
-  const invalidIndex = policy.tools.requireMetadata.findIndex(
-    (entry) =>
-      typeof entry !== "string" ||
-      !SUPPORTED_TOOL_METADATA.includes(
-        entry.trim().toLowerCase() as (typeof SUPPORTED_TOOL_METADATA)[number],
-      ),
-  );
-  if (invalidIndex < 0) {
-    return [];
-  }
-  return [
-    {
-      checkId: CHECK_IDS.policyInvalidFile,
-      severity: "error",
-      message: `${policyPath} tools.requireMetadata[${invalidIndex}] must be a supported metadata key.`,
-      source: "policy",
-      path: policyPath,
-      target: `oc://${policyDocName}/tools/requireMetadata/#${invalidIndex}`,
-      fixHint: `Use supported metadata keys: ${SUPPORTED_TOOL_METADATA.join(", ")}.`,
+  const shape = createOrderedPolicyShape(policy, { policyPath, policyDocName });
+  const finding = shape.list("tools.requireMetadata", {
+    allowed: SUPPORTED_TOOL_METADATA,
+    normalize: "lower",
+    array: {
+      message: "{policy} {property} must be an array of metadata keys.",
+      hint: "Use supported metadata keys: {allowed}.",
     },
-  ];
+    entry: {
+      message: "{policy} {property}[{index}] must be a supported metadata key.",
+      hint: "Use supported metadata keys: {allowed}.",
+    },
+  });
+  return finding === undefined ? [] : [finding];
 }

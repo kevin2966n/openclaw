@@ -1,9 +1,11 @@
 // Voice Call API module exposes the plugin public contract.
+import { asNullableObjectRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { safeParseJson } from "openclaw/plugin-sdk/text-utility-runtime";
 import { fetchWithSsrFGuard } from "../../../api.js";
 import {
   cancelProviderResponseBody,
   readProviderErrorResponseSnippet,
-  readProviderJsonResponseText,
+  readVoiceCallProviderJsonResponse,
 } from "../shared/response-body.js";
 import { requireSupportedTwilioApiHostname } from "../twilio-region.js";
 
@@ -19,19 +21,14 @@ const TWILIO_API_TIMEOUT_MS = 30_000;
 
 /** Parse Twilio JSON error responses without trusting response shape. */
 function parseTwilioApiError(text: string): ParsedTwilioApiError {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object") {
-      return {};
-    }
-    const record = parsed as Record<string, unknown>;
-    return {
-      code: typeof record.code === "number" ? record.code : undefined,
-      message: typeof record.message === "string" ? record.message : undefined,
-    };
-  } catch {
+  const record = asNullableObjectRecord(safeParseJson<unknown>(text));
+  if (!record) {
     return {};
   }
+  return {
+    code: typeof record.code === "number" ? record.code : undefined,
+    message: typeof record.message === "string" ? record.message : undefined,
+  };
 }
 
 /** Error thrown for non-2xx Twilio REST API responses. */
@@ -100,15 +97,10 @@ export async function twilioApiRequest<T = unknown>(params: {
       throw new TwilioApiError(response.status, errorText);
     }
 
-    const text = await readProviderJsonResponseText(response);
-    if (!text) {
-      return undefined as T;
-    }
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      throw new Error("Twilio API returned malformed JSON.");
-    }
+    return (await readVoiceCallProviderJsonResponse<T>(
+      response,
+      "Twilio API returned malformed JSON.",
+    )) as T;
   } finally {
     await release();
   }

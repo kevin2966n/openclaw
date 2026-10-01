@@ -3,12 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
-import type { SessionEntry } from "../../config/sessions/types.js";
-import type { ReplyPayload } from "../reply-payload.js";
+import type { InternalSessionEntry as SessionEntry } from "../../config/sessions/types.js";
 import {
-  capturePendingFinalDeliveryIdentity,
+  getReplyPayloadMetadata,
+  setReplyPayloadMetadata,
+  type ReplyPayload,
+} from "../reply-payload.js";
+import {
   clearPendingFinalDeliveryAfterSuccess,
-  reconcilePendingFinalDeliveryAfterSettlement,
+  suppressPendingFinalDelivery,
 } from "./dispatch-from-config.pending-final.js";
 import { retireTerminalRestartRecoverySourceClaim } from "./restart-recovery-claim.js";
 
@@ -27,102 +30,104 @@ describe("pending final delivery restart proof", () => {
   });
 
   async function writePendingFinal(
-    beforeAgentReplyState: "continue" | "handled-reply",
+    beforeAgentReplyState: "handled-reply" | undefined,
+    state: "prepared" | "delivered" = "delivered",
+    updatedAt = Date.now(),
   ): Promise<void> {
-    await replaceSessionEntry({ storePath, sessionKey }, {
+    const entry: SessionEntry = {
       sessionId: "session",
       status: "running",
       startedAt: 10,
-      updatedAt: Date.now(),
-      pendingFinalDelivery: true,
-      pendingFinalDeliveryText: "hook reply",
-      pendingFinalDeliveryCreatedAt: 1,
-      pendingFinalDeliveryIntentId: "intent-1",
+      lifecycleRunId: "active-run",
+      updatedAt,
+      pendingFinalDelivery: {
+        kind: "replayable",
+        text: "hook reply",
+        createdAt: 1,
+        intentId: "intent-1",
+        deliveries: [{ id: "delivery-1", state }],
+      },
       restartRecoveryBeforeAgentReplyState: beforeAgentReplyState,
       restartRecoveryForceSafeTools: beforeAgentReplyState === "handled-reply" ? true : undefined,
       restartRecoverySourceIngress: "channel",
-    } satisfies SessionEntry);
+    };
+    await replaceSessionEntry({ storePath, sessionKey }, entry);
   }
 
-  it.each(["continue", "handled-reply"] as const)(
-    "clears %s provenance only after the exact pending intent succeeds",
-    async (beforeAgentReplyState) => {
-      await writePendingFinal(beforeAgentReplyState);
-      const identity = capturePendingFinalDeliveryIdentity({
+  function pendingFinalPayload(deliveryId = "delivery-1"): ReplyPayload {
+    const payload: ReplyPayload = { text: "hook reply" };
+    setReplyPayloadMetadata(payload, {
+      pendingFinalDeliveryCompletion: {
+        deliveryId,
         intentId: "intent-1",
+        sessionId: "session",
         sessionKey,
         storePath,
-      });
+      },
+    });
+    return payload;
+  }
 
-      await clearPendingFinalDeliveryAfterSuccess({ identity, sessionKey, storePath });
+  it("clears hook provenance after its exact intent succeeds without changing user activity", async () => {
+    await writePendingFinal("handled-reply", "delivered", 1);
+    const identity = getReplyPayloadMetadata(pendingFinalPayload())?.pendingFinalDeliveryCompletion;
 
-      const entry = loadSessionEntry({ sessionKey, storePath });
-      expect(entry?.pendingFinalDelivery).toBeUndefined();
-      expect(entry?.pendingFinalDeliveryText).toBeUndefined();
-      expect(entry?.pendingFinalDeliveryIntentId).toBeUndefined();
-      expect(entry?.restartRecoveryBeforeAgentReplyState).toBeUndefined();
-      expect(entry?.restartRecoveryForceSafeTools).toBeUndefined();
-      expect(entry?.restartRecoverySourceIngress).toBeUndefined();
-      expect(entry?.status).toBe(beforeAgentReplyState === "handled-reply" ? "done" : "running");
-      if (beforeAgentReplyState === "handled-reply") {
-        expect(entry?.endedAt).toBeTypeOf("number");
-        expect(entry?.runtimeMs).toBeGreaterThanOrEqual(0);
-      }
-    },
-  );
+    await clearPendingFinalDeliveryAfterSuccess(identity, { preserveActivity: true });
 
-  it("finalizes a media-only hook turn after its exact transport intent succeeds", async () => {
+    const entry = loadSessionEntry({ sessionKey, storePath }) as SessionEntry | undefined;
+    expect(entry?.pendingFinalDelivery).toBeUndefined();
+    expect(entry?.restartRecoveryBeforeAgentReplyState).toBeUndefined();
+    expect(entry?.restartRecoveryForceSafeTools).toBeUndefined();
+    expect(entry?.restartRecoverySourceIngress).toBeUndefined();
+    expect(entry?.status).toBe("done");
+    expect(entry?.lifecycleRunId).toBeUndefined();
+    expect(entry?.abortedLastRun).toBe(false);
+    expect(entry?.endedAt).toBeTypeOf("number");
+    expect(entry?.runtimeMs).toBeGreaterThanOrEqual(0);
+    expect(entry?.updatedAt).toBe(1);
+  });
+
+  it("clears a skipped turn only after every sendable final is suppressed", async () => {
+    await writePendingFinal(undefined, "prepared", 1);
     await replaceSessionEntry(
       { storePath, sessionKey },
       {
-        sessionId: "session",
-        status: "running",
-        startedAt: 10,
-        updatedAt: Date.now(),
-        pendingFinalDelivery: true,
-        pendingFinalDeliveryIntentId: "intent-media",
-        restartRecoveryBeforeAgentReplyState: "handled-unrecoverable",
-        restartRecoverySourceIngress: "channel",
+        ...(loadSessionEntry({ sessionKey, storePath }) as SessionEntry),
+        pendingFinalDelivery: {
+          kind: "replayable",
+          text: "hook reply",
+          createdAt: 1,
+          intentId: "intent-1",
+          deliveries: [
+            { id: "delivery-1", state: "prepared" },
+            { id: "delivery-2", state: "prepared" },
+          ],
+        },
       },
     );
-    const identity = capturePendingFinalDeliveryIdentity({
-      intentId: "intent-media",
-      sessionKey,
-      storePath,
+
+    await suppressPendingFinalDelivery(pendingFinalPayload("delivery-1"), {
+      preserveActivity: true,
     });
 
-    await clearPendingFinalDeliveryAfterSuccess({ identity, sessionKey, storePath });
+    expect(
+      (loadSessionEntry({ sessionKey, storePath }) as SessionEntry).pendingFinalDelivery
+        ?.deliveries,
+    ).toEqual([
+      { id: "delivery-1", state: "suppressed" },
+      { id: "delivery-2", state: "prepared" },
+    ]);
 
-    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
-      status: "done",
-      abortedLastRun: false,
-    });
-  });
-
-  it("keeps normal-turn provenance when transport fails before delivery", async () => {
-    await writePendingFinal("continue");
-    const identity = capturePendingFinalDeliveryIdentity({
-      intentId: "intent-1",
-      sessionKey,
-      storePath,
-    });
-    const payload: ReplyPayload = { text: "hook reply" };
-
-    await reconcilePendingFinalDeliveryAfterSettlement({
-      deliveries: [{ outcome: "failed-before-deliver", payload }],
-      identity,
-      replies: [payload],
-      sessionKey,
-      storePath,
+    await suppressPendingFinalDelivery(pendingFinalPayload("delivery-2"), {
+      preserveActivity: true,
     });
 
-    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({
-      pendingFinalDelivery: true,
-      pendingFinalDeliveryText: "hook reply",
-      pendingFinalDeliveryIntentId: "intent-1",
-      restartRecoveryBeforeAgentReplyState: "continue",
-      restartRecoverySourceIngress: "channel",
-    });
+    const entry = loadSessionEntry({ sessionKey, storePath }) as SessionEntry;
+    expect(entry.pendingFinalDelivery).toBeUndefined();
+    expect(entry.restartRecoverySourceIngress).toBeUndefined();
+    expect(entry.status).toBe("running");
+    expect(entry.lifecycleRunId).toBe("active-run");
+    expect(entry.updatedAt).toBe(1);
   });
 
   it("does not retire a source while its terminal provider outcome is unknown", async () => {
@@ -141,6 +146,7 @@ describe("pending final delivery restart proof", () => {
 
     await expect(
       retireTerminalRestartRecoverySourceClaim({
+        agentId: "main",
         sessionId: "session",
         sessionKey,
         sourceTurnId: "source-1",

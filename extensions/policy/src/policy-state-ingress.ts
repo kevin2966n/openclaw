@@ -1,10 +1,9 @@
-// Policy plugin ingress evidence.
 import {
+  asNonArrayRecord,
   isRecord,
   asBoolean as readBoolean,
   normalizeOptionalString as readString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { configuredChannels } from "./policy-state-core.js";
 import { ocPathSegment } from "./policy-state-helpers.js";
 import { IMPLICIT_DEFAULT_ACCOUNT_FIELDS } from "./policy-state-tool-posture.js";
 import { RESERVED_CHANNEL_CONFIG_KEYS } from "./policy-state-types.js";
@@ -24,12 +23,12 @@ const ALLOWLIST_DEFAULT_INGRESS_GROUP_POLICY_CHANNELS = new Set([
 const OPEN_GROUPS_DEFAULT_TO_NO_MENTION_CHANNELS = new Set(["feishu", "qa-channel"]);
 
 export function scanPolicyIngress(cfg: Record<string, unknown>): readonly PolicyIngressEvidence[] {
-  const channels = configuredChannels(cfg);
-  const channelDefaults = isRecord(channels.defaults) ? channels.defaults : {};
+  const channels = asNonArrayRecord(cfg.channels);
+  const channelDefaults = asNonArrayRecord(channels.defaults);
   const inheritedChannelDefaults = pickSupportedIngressDefaults(channelDefaults);
   const channelDefaultsSource = "oc://openclaw.config/channels/defaults";
   const entries: PolicyIngressEvidence[] = [];
-  const session = isRecord(cfg.session) ? cfg.session : {};
+  const session = asNonArrayRecord(cfg.session);
   const dmScope = readString(session.dmScope)?.toLowerCase();
   entries.push({
     id: "session-dm-scope",
@@ -44,7 +43,7 @@ export function scanPolicyIngress(cfg: Record<string, unknown>): readonly Policy
       continue;
     }
     const channelSource = `oc://openclaw.config/channels/${ocPathSegment(channel)}`;
-    const accounts = isRecord(value.accounts) ? value.accounts : {};
+    const accounts = asNonArrayRecord(value.accounts);
     const configuredAccounts = Object.entries(accounts).filter(
       (entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]),
     );
@@ -60,13 +59,13 @@ export function scanPolicyIngress(cfg: Record<string, unknown>): readonly Policy
       });
     }
     for (const [accountId, account] of activeAccounts) {
-      const inheritsNestedContainers = channel !== "telegram" || configuredAccounts.length <= 1;
       pushChannelIngress(entries, {
         channel,
         accountId,
         config: account,
         inheritedConfig: value,
-        inheritNestedContainers: inheritsNestedContainers,
+        inheritNestedContainers: true,
+        inheritEmptyNestedContainers: channel === "telegram" && configuredAccounts.length <= 1,
         sourceBase: `${channelSource}/accounts/${ocPathSegment(accountId)}`,
         inheritedSourceBase: channelSource,
         fallbackConfig: inheritedChannelDefaults,
@@ -140,6 +139,7 @@ type ChannelIngressParams = {
   readonly config: Record<string, unknown>;
   readonly inheritedConfig: Record<string, unknown>;
   readonly inheritNestedContainers?: boolean;
+  readonly inheritEmptyNestedContainers?: boolean;
   readonly sourceBase: string;
   readonly inheritedSourceBase: string;
   readonly fallbackConfig?: Record<string, unknown>;
@@ -150,18 +150,9 @@ function pushChannelIngress(entries: PolicyIngressEvidence[], params: ChannelIng
   const localDmPolicy = channelDmPolicy(params.config);
   const inheritedDmPolicy = channelDmPolicy(params.inheritedConfig);
   const fallbackDmPolicy = channelDmPolicy(params.fallbackConfig ?? {});
-  const effectiveDmPolicy =
-    localDmPolicy.disabledByEnabled === true
-      ? localDmPolicy
-      : localDmPolicy.value !== undefined
-        ? localDmPolicy
-        : inheritedDmPolicy.disabledByEnabled === true
-          ? inheritedDmPolicy
-          : inheritedDmPolicy.value !== undefined
-            ? inheritedDmPolicy
-            : fallbackDmPolicy.disabledByEnabled === true || fallbackDmPolicy.value !== undefined
-              ? fallbackDmPolicy
-              : undefined;
+  const effectiveDmPolicy = [localDmPolicy, inheritedDmPolicy, fallbackDmPolicy].find(
+    (policy) => policy.value !== undefined,
+  );
   const dmPolicySource =
     effectiveDmPolicy?.sourceSuffix === undefined
       ? `${params.fallbackSourceBase}/dmPolicy`
@@ -212,22 +203,15 @@ function channelImplicitGroupPolicy(params: ChannelIngressParams): {
   readonly source: string;
   readonly value: "allowlist" | "open";
 } {
-  for (const [config, sourceBase] of [
-    [params.config, params.sourceBase],
-    ...(params.inheritNestedContainers === true
-      ? ([[params.inheritedConfig, params.inheritedSourceBase]] as const)
-      : []),
-    [params.fallbackConfig, params.fallbackSourceBase],
-  ] as const) {
-    if (config === undefined || sourceBase === undefined) {
-      continue;
-    }
-    for (const key of ["groups"] as const) {
-      const container = isRecord(config[key]) ? config[key] : undefined;
-      if (container !== undefined && Object.keys(container).length > 0) {
-        return { source: `${sourceBase}/${key}`, value: "allowlist" };
-      }
-    }
+  const groups = effectiveNestedIngressContainer(params, "groups");
+  if (groups !== undefined) {
+    return { source: `${groups.sourceBase}/groups`, value: "allowlist" };
+  }
+  const fallbackGroups = isRecord(params.fallbackConfig?.groups)
+    ? params.fallbackConfig.groups
+    : undefined;
+  if (fallbackGroups !== undefined && Object.keys(fallbackGroups).length > 0) {
+    return { source: `${params.fallbackSourceBase}/groups`, value: "allowlist" };
   }
   return {
     source: `${params.sourceBase}/groupPolicy`,
@@ -274,8 +258,12 @@ function pushChannelRequireMentionIngress(
       fallbackRequireMention !== undefined,
   });
 
-  const containers = nestedIngressContainers(params);
-  for (const { containerKey, container, sourceBase } of containers) {
+  for (const containerKey of ["groups", "guilds", "channels", "rooms", "teams"] as const) {
+    const effective = effectiveNestedIngressContainer(params, containerKey);
+    if (effective === undefined) {
+      continue;
+    }
+    const { container, sourceBase } = effective;
     for (const [groupId, groupConfig] of Object.entries(container)) {
       if (!isRecord(groupConfig)) {
         continue;
@@ -306,57 +294,48 @@ function channelDefaultRequireMention(params: ChannelIngressParams): boolean {
 function channelWildcardRequireMention(
   params: ChannelIngressParams,
 ): { readonly source: string; readonly value: boolean } | undefined {
-  for (const [config, sourceBase] of [
-    [params.config, params.sourceBase],
-    [params.inheritedConfig, params.inheritedSourceBase],
-    [params.fallbackConfig, params.fallbackSourceBase],
-  ] as const) {
-    if (config === undefined || sourceBase === undefined) {
-      continue;
+  for (const key of ["groups", "guilds", "channels", "rooms", "teams"] as const) {
+    const effective = effectiveNestedIngressContainer(params, key);
+    const wildcard = isRecord(effective?.container["*"]) ? effective.container["*"] : undefined;
+    const requireMention = readBoolean(wildcard?.requireMention);
+    if (wildcard?.enabled !== false && requireMention !== undefined && effective !== undefined) {
+      return {
+        source: `${effective.sourceBase}/${key}/${ocPathSegment("*")}/requireMention`,
+        value: requireMention,
+      };
     }
-    for (const key of ["groups", "guilds", "channels", "rooms", "teams"] as const) {
-      const container = isRecord(config[key]) ? config[key] : undefined;
-      const wildcard = isRecord(container?.["*"]) ? container["*"] : undefined;
-      const requireMention = readBoolean(wildcard?.requireMention);
-      if (wildcard?.enabled !== false && requireMention !== undefined) {
-        return {
-          source: `${sourceBase}/${key}/${ocPathSegment("*")}/requireMention`,
-          value: requireMention,
-        };
-      }
+    const fallbackContainer = isRecord(params.fallbackConfig?.[key])
+      ? params.fallbackConfig[key]
+      : undefined;
+    const fallbackWildcard = isRecord(fallbackContainer?.["*"])
+      ? fallbackContainer["*"]
+      : undefined;
+    const fallbackRequireMention = readBoolean(fallbackWildcard?.requireMention);
+    if (fallbackWildcard?.enabled !== false && fallbackRequireMention !== undefined) {
+      return {
+        source: `${params.fallbackSourceBase}/${key}/${ocPathSegment("*")}/requireMention`,
+        value: fallbackRequireMention,
+      };
     }
   }
   return undefined;
 }
 
-function nestedIngressContainers(params: ChannelIngressParams): readonly {
-  readonly containerKey: string;
-  readonly container: Record<string, unknown>;
-  readonly sourceBase: string;
-}[] {
-  const containers: {
-    readonly containerKey: string;
-    readonly container: Record<string, unknown>;
-    readonly sourceBase: string;
-  }[] = [];
-  for (const key of ["groups", "guilds", "channels", "rooms", "teams"] as const) {
-    const local = isRecord(params.config[key]) ? params.config[key] : undefined;
-    const inherited = isRecord(params.inheritedConfig[key])
-      ? params.inheritedConfig[key]
-      : undefined;
-    if (local !== undefined) {
-      if (Object.keys(local).length > 0) {
-        containers.push({ containerKey: key, container: local, sourceBase: params.sourceBase });
-      }
-    } else if (params.inheritNestedContainers === true && inherited !== undefined) {
-      containers.push({
-        containerKey: key,
-        container: inherited,
-        sourceBase: params.inheritedSourceBase,
-      });
-    }
+function effectiveNestedIngressContainer(
+  params: ChannelIngressParams,
+  key: "groups" | "guilds" | "channels" | "rooms" | "teams",
+): { readonly container: Record<string, unknown>; readonly sourceBase: string } | undefined {
+  const local = isRecord(params.config[key]) ? params.config[key] : undefined;
+  const inherited = isRecord(params.inheritedConfig[key]) ? params.inheritedConfig[key] : undefined;
+  if (local !== undefined && Object.keys(local).length > 0) {
+    return { container: local, sourceBase: params.sourceBase };
   }
-  return containers;
+  const inheritsEmpty = local !== undefined && params.inheritEmptyNestedContainers === true;
+  const inheritsMissing = local === undefined && params.inheritNestedContainers === true;
+  if ((inheritsEmpty || inheritsMissing) && inherited !== undefined) {
+    return { container: inherited, sourceBase: params.inheritedSourceBase };
+  }
+  return undefined;
 }
 
 function pushNestedRequireMentionIngress(
@@ -380,8 +359,8 @@ function pushNestedRequireMentionIngress(
       channel: params.channel,
       ...(params.accountId === undefined ? {} : { accountId: params.accountId }),
       groupId,
-      value: requireMention ?? true,
-      explicit: requireMention !== undefined,
+      value: requireMention,
+      explicit: true,
     });
   }
   for (const nestedKey of ["channels", "topics"] as const) {
@@ -407,11 +386,10 @@ function pushNestedRequireMentionIngress(
 function channelDmPolicy(config: Record<string, unknown>): {
   readonly value?: string;
   readonly sourceSuffix?: string;
-  readonly disabledByEnabled?: boolean;
 } {
-  const dm = isRecord(config.dm) ? config.dm : {};
+  const dm = asNonArrayRecord(config.dm);
   if (dm.enabled === false) {
-    return { value: "disabled", sourceSuffix: "dm/enabled", disabledByEnabled: true };
+    return { value: "disabled", sourceSuffix: "dm/enabled" };
   }
   const direct = readString(config.dmPolicy);
   if (direct !== undefined) {

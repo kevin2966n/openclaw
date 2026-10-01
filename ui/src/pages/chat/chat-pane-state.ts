@@ -1,10 +1,21 @@
 import type { GatewaySessionRow } from "../../api/types.ts";
-import { resolveControlUiAuthToken } from "../../app/control-ui-auth.ts";
+import type { ApplicationContext } from "../../app/context.ts";
+import { t } from "../../i18n/index.ts";
+import { isChatControlCommand } from "../../lib/chat/commands.ts";
+import {
+  resolveControlUiFollowUpMode,
+  resolveControlUiServerQueueMode,
+} from "../../lib/chat/follow-up-mode.ts";
+import { getChatHistoryLoadState } from "./chat-history-state.ts";
+import { chatSendPendingReason } from "./chat-send-support.ts";
+import type { ChatState } from "./chat-state-contract.ts";
+import type { ChatPageHost } from "./chat-state-host.ts";
 
 type SelectedSessionProjectionState = {
   chatEffectiveQueueMode?: GatewaySessionRow["effectiveQueueMode"];
   chatQueueModeOverride?: GatewaySessionRow["queueMode"];
   selectedChatSessionArchived: boolean;
+  selectedChatSessionIncognito: boolean;
 };
 
 export function applySelectedSessionProjection(
@@ -15,6 +26,7 @@ export function applySelectedSessionProjection(
     return false;
   }
   state.selectedChatSessionArchived = session.archived === true;
+  state.selectedChatSessionIncognito = session.incognito === true;
   state.chatQueueModeOverride = session.queueMode;
   state.chatEffectiveQueueMode = session.effectiveQueueMode;
   return true;
@@ -75,14 +87,6 @@ export class SessionParticipationTracker {
   }
 }
 
-export function resolveAssistantAttachmentAuthToken(state: {
-  hello?: { auth?: { deviceToken?: string | null } | null } | null;
-  password?: string | null;
-  settings?: { token?: string | null } | null;
-}) {
-  return resolveControlUiAuthToken(state);
-}
-
 export function dismissChatError(state: {
   chatError?: string | null;
   lastError: string | null;
@@ -91,4 +95,44 @@ export function dismissChatError(state: {
   state.lastError = null;
   state.lastErrorCode = null;
   state.chatError = null;
+}
+
+export function chatSubmitState(
+  state: ChatState & Pick<ChatPageHost, "handleChatDraftChange">,
+  unavailable: boolean,
+  nativeChat: boolean,
+) {
+  const historyLoad = getChatHistoryLoadState(state);
+  const failure = unavailable && historyLoad.phase === "failed" ? historyLoad.message : null;
+  const pendingReason = nativeChat ? chatSendPendingReason(state, state.sessionKey) : null;
+  const controlCommand = isChatControlCommand(state.chatMessage);
+  return {
+    ...(pendingReason && !controlCommand ? { canSend: false } : {}),
+    submitDisabledReason:
+      pendingReason ?? (unavailable ? (failure ?? t("chat.thread.loading")) : null),
+    submitPending: pendingReason !== null || (unavailable && historyLoad.phase !== "failed"),
+    onDraftChange: (...args: Parameters<ChatPageHost["handleChatDraftChange"]>) => {
+      state.handleChatDraftChange(...args);
+      // Nonempty draft edits can skip a pane render, but this gate depends on command intent.
+      if (pendingReason && controlCommand !== isChatControlCommand(state.chatMessage)) {
+        state.requestUpdate?.();
+      }
+    },
+  };
+}
+
+export function resolveChatPaneFollowUpMode(
+  state: Pick<ChatPageHost, "settings" | "chatEffectiveQueueMode" | "chatQueueModeOverride">,
+  session: GatewaySessionRow | undefined,
+  runtimeConfig: ApplicationContext["runtimeConfig"]["state"],
+) {
+  return resolveControlUiFollowUpMode(
+    state.settings.chatFollowUpMode,
+    resolveControlUiServerQueueMode(runtimeConfig.configSnapshot?.runtimeConfig, {
+      configNeedsApply: runtimeConfig.configNeedsApply,
+      effectiveMode: state.chatEffectiveQueueMode,
+      sessionMetadataLoaded: session !== undefined || state.chatEffectiveQueueMode !== undefined,
+      sessionMode: state.chatQueueModeOverride,
+    }),
+  );
 }

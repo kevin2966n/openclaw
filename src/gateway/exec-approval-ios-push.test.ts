@@ -2,9 +2,9 @@
  * Tests iOS push notification dispatch for exec approval requests.
  */
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import type { ExecApprovalRequest, ExecApprovalResolved } from "../infra/exec-approvals.js";
 import type { PluginApprovalRequest, PluginApprovalResolved } from "../infra/plugin-approvals.js";
-import { createDeferred } from "../test-utils/deferred.js";
 
 const listDevicePairingMock = vi.fn();
 const loadApnsRegistrationMock = vi.fn();
@@ -445,23 +445,6 @@ describe("createExecApprovalIosPushDelivery", () => {
       expect(sendApnsPluginApprovalResolvedWakeMock).toHaveBeenCalledWith(
         expect.objectContaining({ approvalId: "plugin:expired" }),
       );
-    });
-
-    it("routes exec and plugin factories through the same paired-target resolver", async () => {
-      mockPairedIosOperator(["operator.approvals", "operator.read"]);
-
-      await createExecApprovalIosPushDelivery({ log: {} }).handleRequested(
-        approvalRequest("exec-shared-target"),
-      );
-      await createPluginApprovalIosPushDelivery({ log: {} }).handleRequested(
-        pluginApprovalRequest("plugin:shared-target"),
-      );
-
-      expect(listDevicePairingMock).toHaveBeenCalledTimes(2);
-      expect(loadApnsRegistrationsMock).toHaveBeenNthCalledWith(1, ["ios-device-1"]);
-      expect(loadApnsRegistrationsMock).toHaveBeenNthCalledWith(2, ["ios-device-1"]);
-      expect(sendApnsExecApprovalAlertMock).toHaveBeenCalledTimes(1);
-      expect(sendApnsPluginApprovalAlertMock).toHaveBeenCalledTimes(1);
     });
   });
 });

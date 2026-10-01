@@ -38,10 +38,11 @@ async function waitForLiveQaGatewayConfigApplied(params: {
         configRevisionHash: status.configRevisionHash,
         hash: status.hash,
       };
+      // The persisted raw-config hash and normalized runtime revision use different encodings.
       if (
         status.hash === params.expectedHash &&
-        status.configRevisionHash === params.expectedHash &&
-        status.appliedConfigHash === params.expectedHash
+        typeof status.configRevisionHash === "string" &&
+        status.appliedConfigHash === status.configRevisionHash
       ) {
         return;
       }
@@ -105,7 +106,7 @@ export async function patchLiveQaGatewayConfig(params: {
       if (!patchResult.hash) {
         throw new Error("live QA config patch returned no persisted hash");
       }
-      // Restart-required writes acknowledge before SIGUSR1 completes. The old
+      // Restart-required writes acknowledge before SIGUSR2 completes. The old
       // Gateway can still look healthy, so require the active runtime revision.
       await waitForLiveQaGatewayConfigApplied({
         expectedHash: patchResult.hash,

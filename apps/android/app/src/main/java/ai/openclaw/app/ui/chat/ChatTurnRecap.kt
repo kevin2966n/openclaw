@@ -12,7 +12,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
+import java.math.RoundingMode
+import java.text.NumberFormat
 import java.util.Locale
 
 internal data class TurnRecap(
@@ -25,11 +28,6 @@ internal data class TurnRecapTranscriptState(
   val newestItemId: String?,
   val completedEndedAt: Long?,
   val completedNewestItemId: String?,
-)
-
-internal data class TurnRecapTokenFormat(
-  val singular: Boolean,
-  val count: String,
 )
 
 /**
@@ -81,32 +79,7 @@ internal class TurnRecapResolver(
     sessionKey: String,
     indicatorVisible: Boolean,
     row: ChatSessionEntry?,
-  ): TurnRecap? =
-    resolveInternal(
-      sessionKey = sessionKey,
-      indicatorVisible = indicatorVisible,
-      row = row,
-      transcript = null,
-    )
-
-  fun resolve(
-    sessionKey: String,
-    indicatorVisible: Boolean,
-    row: ChatSessionEntry?,
-    transcript: TurnRecapTranscriptState,
-  ): TurnRecap? =
-    resolveInternal(
-      sessionKey = sessionKey,
-      indicatorVisible = indicatorVisible,
-      row = row,
-      transcript = transcript,
-    )
-
-  private fun resolveInternal(
-    sessionKey: String,
-    indicatorVisible: Boolean,
-    row: ChatSessionEntry?,
-    transcript: TurnRecapTranscriptState?,
+    transcript: TurnRecapTranscriptState? = null,
   ): TurnRecap? {
     val watch = watches[sessionKey]
     val rowEndedAt = row?.endedAt
@@ -202,7 +175,6 @@ internal class TurnRecapResolver(
       watches.remove(sessionKey)
       return null
     }
-    watches.remove(sessionKey)
     val settled = watch.pendingTerminal ?: terminal
     watches[sessionKey] =
       watch.copy(
@@ -215,16 +187,8 @@ internal class TurnRecapResolver(
 
 @Composable
 internal fun ChatTurnRecapRow(recap: TurnRecap) {
-  val duration = formatLocalizedChatDurationCompact(recap.runtimeMs.coerceAtLeast(1_000L))
-  val tokens =
-    recap.outputTokens?.let { count ->
-      val format = turnRecapTokenFormat(count)
-      if (format.singular) {
-        nativeStringResource("1 token")
-      } else {
-        nativeStringResource("\$count tokens", format.count)
-      }
-    }
+  val duration = formatLocalizedChatDurationFull(recap.runtimeMs.coerceAtLeast(1_000L))
+  val tokens = recap.outputTokens?.let { localizedChatOutputTokens(it) }
   Row(
     modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
     verticalAlignment = Alignment.CenterVertically,
@@ -243,22 +207,39 @@ internal fun ChatTurnRecapRow(recap: TurnRecap) {
   }
 }
 
-internal fun turnRecapTokenFormat(count: Long): TurnRecapTokenFormat = TurnRecapTokenFormat(singular = count == 1L, count = formatCompactTokenCount(count))
-
-internal fun formatCompactTokenCount(count: Long): String {
-  fun decimal(value: Double): String = String.format(Locale.US, "%.1f", value).removeSuffix(".0")
-
-  fun millions(): String {
-    val value = decimal(count / 1_000_000.0)
-    return nativeString("\${decimal(count / 1_000_000.0)}M", value)
+@Composable
+internal fun localizedChatOutputTokens(count: Long): String {
+  val locale = LocalConfiguration.current.locales[0]
+  return if (count == 1L) {
+    nativeStringResource("1 token")
+  } else {
+    nativeStringResource("\$count tokens", formatCompactTokenCount(count, locale))
   }
+}
+
+internal fun formatCompactTokenCount(
+  count: Long,
+  locale: Locale = Locale.getDefault(),
+): String {
+  val decimalFormat =
+    NumberFormat.getNumberInstance(locale).apply {
+      isGroupingUsed = false
+      minimumFractionDigits = 0
+      maximumFractionDigits = 1
+      roundingMode = RoundingMode.HALF_UP
+    }
 
   return when {
-    count >= 1_000_000L -> millions()
-    count >= 1_000L -> {
-      val thousands = decimal(count / 1_000.0)
-      if (thousands == "1000") millions() else nativeString("\${thousands}k", thousands)
+    count >= 999_950L -> {
+      nativeString("\${decimal(count / 1_000_000.0)}M", decimalFormat.format(count / 1_000_000.0))
     }
-    else -> count.toString()
+
+    count >= 1_000L -> {
+      nativeString("\${thousands}k", decimalFormat.format(count / 1_000.0))
+    }
+
+    else -> {
+      count.toString()
+    }
   }
 }

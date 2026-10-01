@@ -1,5 +1,5 @@
 // Page-side host for the channel setup wizard: owns the RPC controller,
-// per-step multiselect state, dirty-config guarding, and completion effects
+// per-step form state, dirty-config guarding, and completion effects
 // (config resync + WhatsApp QR handoff) so the page element stays thin.
 import type { ApplicationContext } from "../../app/context.ts";
 import { t } from "../../i18n/index.ts";
@@ -14,8 +14,10 @@ type WizardHostDeps = {
 
 export class ChannelWizardHost {
   multiselect: unknown[] = [];
+  textValue = "";
+  secretVisible = false;
   blockedByDirtyConfig = false;
-  private multiselectStepId: string | null = null;
+  private stepId: string | null = null;
   private lastPhase = "idle";
   private readonly controller: ChannelWizardController;
 
@@ -78,16 +80,32 @@ export class ChannelWizardHost {
     this.deps.requestUpdate();
   }
 
+  setTextValue(value: string): void {
+    this.textValue = value;
+  }
+
+  toggleSecretVisibility(): void {
+    this.secretVisible = !this.secretVisible;
+    this.deps.requestUpdate();
+  }
+
   private handleControllerChange(): void {
-    // Pending multiselect toggles survive busy re-renders but reset per step.
+    // Pending input state survives unrelated page re-renders but resets per step.
     const wizard = this.controller.state;
     const stepId = wizard.phase === "step" ? wizard.step.id : null;
-    if (stepId !== this.multiselectStepId) {
-      this.multiselectStepId = stepId;
+    if (stepId !== this.stepId) {
+      this.stepId = stepId;
       this.multiselect =
         wizard.phase === "step" && Array.isArray(wizard.step.initialValue)
           ? [...wizard.step.initialValue]
           : [];
+      this.textValue =
+        wizard.phase === "step" &&
+        wizard.step.type === "text" &&
+        typeof wizard.step.initialValue === "string"
+          ? wizard.step.initialValue
+          : "";
+      this.secretVisible = false;
     }
     if (wizard.phase === "done" && this.lastPhase !== "done") {
       void this.handleCompleted(wizard.accounts);
@@ -104,7 +122,7 @@ export class ChannelWizardHost {
       return;
     }
     // The wizard rewrote openclaw.json on the gateway; resync the local draft.
-    await context.runtimeConfig.refresh({ discardPendingChanges: true });
+    await context.runtimeConfig.discardDraft({ reloadOnly: true });
     await context.channels.refresh(true);
     const whatsapp = accounts.find((entry) => entry.channel === "whatsapp");
     if (whatsapp) {

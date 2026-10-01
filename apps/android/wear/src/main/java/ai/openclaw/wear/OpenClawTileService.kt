@@ -49,7 +49,14 @@ class OpenClawTileService :
                 protoLayoutResourceId = "openclaw_core_mascot",
               )
             },
-            labelContent = { text(getString(R.string.talk).uppercase().layoutString) },
+            labelContent = {
+              text(
+                wearUppercase(
+                  getString(R.string.talk),
+                  resources.configuration.locales[0],
+                ).layoutString,
+              )
+            },
             secondaryLabelContent = { text(getString(R.string.tile_phone_proxy).layoutString) },
           )
         },
@@ -83,7 +90,7 @@ private val openClawTileColorScheme =
     onSurfaceVariant = 0xFFA8A8A8.argb,
     outline = 0xFF3A3A3A.argb,
     outlineVariant = 0xFF242424.argb,
-    background = 0xFF030303.argb,
+    background = 0xFF000000.argb,
     onBackground = 0xFFF8F8F8.argb,
   )
 

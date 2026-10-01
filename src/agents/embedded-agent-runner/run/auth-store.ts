@@ -5,18 +5,15 @@ import type { RuntimeAuthState } from "./helpers.js";
 export function resolveAttemptDispatchApiKey(params: {
   apiKeyInfo: ResolvedProviderAuth | null;
   runtimeAuthState: RuntimeAuthState | null;
+  pluginHarnessOwnsTransport: boolean;
 }): string | undefined {
   if (params.runtimeAuthState) {
-    return undefined;
+    // Core streaming consumes the provider-prepared runtime credential from
+    // authStorage. A transport-owning harness instead needs the original
+    // resolved profile credential promised by its attempt contract.
+    return params.pluginHarnessOwnsTransport ? params.runtimeAuthState.sourceApiKey : undefined;
   }
   return params.apiKeyInfo?.apiKey;
-}
-
-function createEmptyAuthProfileStore(): AuthProfileStore {
-  return {
-    version: 1,
-    profiles: {},
-  };
 }
 
 export function createScopedAuthProfileStore(
@@ -54,5 +51,5 @@ export function createScopedAuthProfileStore(
           ? { runtimeExternalProfileIdsAuthoritative: true }
           : {}),
       }
-    : createEmptyAuthProfileStore();
+    : { version: 1, profiles: {} };
 }

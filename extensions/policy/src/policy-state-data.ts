@@ -1,14 +1,17 @@
-// Policy plugin data, secret, and auth evidence.
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { coerceSecretRef } from "openclaw/plugin-sdk/secret-input";
-import { isRecord, asBoolean as readBoolean } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { ocPathSegment } from "./policy-state-helpers.js";
+import {
+  asBoolean as readBoolean,
+  asNonArrayRecord,
+  isRecord,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { collectPolicyConfiguredAgents, ocPathSegment } from "./policy-state-helpers.js";
 import type {
   PolicyAuthProfileEvidence,
   PolicyDataHandlingEvidence,
+  PolicyEvidenceBuilder,
   PolicySecretEvidence,
   SecretRefDefaults,
-  SecretRefEvidence,
 } from "./policy-state-types.js";
 
 export function scanPolicySecrets(cfg: Record<string, unknown>): readonly PolicySecretEvidence[] {
@@ -20,18 +23,12 @@ export function scanPolicySecrets(cfg: Record<string, unknown>): readonly Policy
 export function scanPolicyAuthProfiles(
   cfg: Record<string, unknown>,
 ): readonly PolicyAuthProfileEvidence[] {
-  const auth = isRecord(cfg.auth) ? cfg.auth : {};
-  const profiles = isRecord(auth.profiles) ? auth.profiles : {};
+  const auth = asNonArrayRecord(cfg.auth);
+  const profiles = asNonArrayRecord(auth.profiles);
   return Object.entries(profiles)
     .toSorted(([a], [b]) => a.localeCompare(b))
     .map(([id, value]) => {
-      const entry: {
-        id: string;
-        source: string;
-        validMetadata: boolean;
-        provider?: string;
-        mode?: string;
-      } = {
+      const entry: PolicyEvidenceBuilder<PolicyAuthProfileEvidence> = {
         id,
         source: `oc://openclaw.config/auth/profiles/${ocPathSegment(id)}`,
         validMetadata: isValidAuthProfileMetadata(value),
@@ -64,8 +61,8 @@ export function scanPolicyDataHandling(
     explicit: true,
   });
 
-  const diagnostics = isRecord(cfg.diagnostics) ? cfg.diagnostics : {};
-  const otel = isRecord(diagnostics.otel) ? diagnostics.otel : {};
+  const diagnostics = asNonArrayRecord(cfg.diagnostics);
+  const otel = asNonArrayRecord(diagnostics.otel);
   const otelEnabled = diagnostics.enabled !== false && otel.enabled === true;
   const tracesEnabled = otelEnabled && otel.traces !== false;
   const logsEnabled = otelEnabled && otel.logs === true;
@@ -84,8 +81,8 @@ export function scanPolicyDataHandling(
     explicit: otel.captureContent !== undefined,
   });
 
-  const session = isRecord(cfg.session) ? cfg.session : {};
-  const maintenance = isRecord(session.maintenance) ? session.maintenance : {};
+  const session = asNonArrayRecord(cfg.session);
+  const maintenance = asNonArrayRecord(session.maintenance);
   const retentionMode = typeof maintenance.mode === "string" ? maintenance.mode : "enforce";
   entries.push({
     id: "session-maintenance-mode",
@@ -107,13 +104,7 @@ function telemetryContentCaptureEnabled(
   if (value === true) {
     return signals.tracesEnabled || signals.logsEnabled;
   }
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (!signals.tracesEnabled) {
-    return false;
-  }
-  if (value.enabled !== true) {
+  if (!isRecord(value) || !signals.tracesEnabled || value.enabled !== true) {
     return false;
   }
   return (
@@ -130,26 +121,11 @@ function pushMemorySessionTranscriptIndexing(
   entries: PolicyDataHandlingEvidence[],
   cfg: Record<string, unknown>,
 ): void {
-  const memory = isRecord(cfg.memory) ? cfg.memory : {};
-  const qmd = isRecord(memory.qmd) ? memory.qmd : {};
-  const qmdSessions = isRecord(qmd.sessions) ? qmd.sessions : {};
-  if (qmdSessions.enabled !== undefined) {
-    entries.push({
-      id: "memory-qmd-session-transcripts",
-      kind: "memorySessionTranscriptIndexing",
-      source: "oc://openclaw.config/memory/qmd/sessions/enabled",
-      scope: "global",
-      value: memory.backend === "qmd" && readBoolean(qmdSessions.enabled) === true,
-      explicit: true,
-    });
-  }
-
-  const defaultsMemorySearch = isRecord(memory.search) ? memory.search : {};
+  const memory = asNonArrayRecord(cfg.memory);
+  const defaultsMemorySearch = asNonArrayRecord(memory.search);
   const defaultSessionMemory = memorySearchSessionTranscriptIndexing(defaultsMemorySearch);
   if (defaultSessionMemory !== undefined) {
-    const defaultExperimental = isRecord(defaultsMemorySearch.experimental)
-      ? defaultsMemorySearch.experimental
-      : {};
+    const defaultExperimental = asNonArrayRecord(defaultsMemorySearch.experimental);
     entries.push({
       id: "agents-defaults-memory-session-transcripts",
       kind: "memorySessionTranscriptIndexing",
@@ -164,35 +140,9 @@ function pushMemorySessionTranscriptIndexing(
     });
   }
 
-  const agents = isRecord(cfg.agents) ? cfg.agents : {};
-  const agentEntries = isRecord(agents.entries)
-    ? Object.entries(agents.entries).map(([entryId, value]) => ({
-        agentId: entryId,
-        container: "entries" as const,
-        pathId: entryId,
-        value,
-      }))
-    : [];
-  const legacyAgents = Array.isArray(agents.list)
-    ? agents.list.flatMap((value, index) => {
-        if (!isRecord(value)) {
-          return [];
-        }
-        return [
-          {
-            agentId: typeof value.id === "string" ? value.id : `agent-${index}`,
-            container: "list" as const,
-            pathId: String(index),
-            value,
-          },
-        ];
-      })
-    : [];
-  const configuredAgents = agentEntries.length > 0 ? agentEntries : legacyAgents;
-  if (configuredAgents.length === 0) {
-    return;
-  }
-  configuredAgents.forEach(({ agentId, container, pathId, value: rawAgent }) => {
+  const agents = asNonArrayRecord(cfg.agents);
+  collectPolicyConfiguredAgents(agents).forEach((configured) => {
+    const { agentId, value: rawAgent } = configured;
     if (!isRecord(rawAgent)) {
       return;
     }
@@ -206,16 +156,15 @@ function pushMemorySessionTranscriptIndexing(
       return;
     }
     const explicit = memorySearchSessionTranscriptIndexingHasLocalConfig(memorySearch);
-    const experimental = isRecord(memorySearch?.experimental) ? memorySearch.experimental : {};
-    const pathSegment = container === "list" ? `#${pathId}` : ocPathSegment(pathId);
+    const experimental = asNonArrayRecord(memorySearch?.experimental);
     entries.push({
       id: `${agentId}-memory-session-transcripts`,
       kind: "memorySessionTranscriptIndexing",
       source: explicit
         ? readBoolean(memorySearch?.rememberAcrossConversations) === undefined &&
           readBoolean(experimental.sessionMemory) !== undefined
-          ? `oc://openclaw.config/agents/${container}/${pathSegment}/memory/search/experimental/sessionMemory`
-          : `oc://openclaw.config/agents/${container}/${pathSegment}/memory/search/rememberAcrossConversations`
+          ? `${configured.sourceBase}/memory/search/experimental/sessionMemory`
+          : `${configured.sourceBase}/memory/search/rememberAcrossConversations`
         : "oc://openclaw.config/memory/search/rememberAcrossConversations",
       scope: "agent",
       agentId: normalizeAgentId(agentId),
@@ -232,10 +181,10 @@ function memorySearchSessionTranscriptIndexing(
   if (!isRecord(memorySearch)) {
     return undefined;
   }
-  const inherited = isRecord(inheritedMemorySearch) ? inheritedMemorySearch : {};
+  const inherited = asNonArrayRecord(inheritedMemorySearch);
   const enabled = readBoolean(memorySearch.enabled) ?? readBoolean(inherited.enabled) ?? true;
-  const experimental = isRecord(memorySearch.experimental) ? memorySearch.experimental : {};
-  const inheritedExperimental = isRecord(inherited.experimental) ? inherited.experimental : {};
+  const experimental = asNonArrayRecord(memorySearch.experimental);
+  const inheritedExperimental = asNonArrayRecord(inherited.experimental);
   const rememberAcrossConversations =
     readBoolean(memorySearch.rememberAcrossConversations) ??
     readBoolean(experimental.sessionMemory) ??
@@ -284,17 +233,10 @@ function memorySearchSourcesIncludeSessions(memorySearch: unknown): boolean | un
 }
 
 function scanPolicySecretProviders(cfg: Record<string, unknown>): readonly PolicySecretEvidence[] {
-  const secrets = isRecord(cfg.secrets) ? cfg.secrets : {};
-  const providers = isRecord(secrets.providers) ? secrets.providers : {};
+  const secrets = asNonArrayRecord(cfg.secrets);
+  const providers = asNonArrayRecord(secrets.providers);
   return Object.entries(providers).map(([id, value]) => {
-    const insecure = secretProviderInsecureFlags(value);
-    const entry: {
-      id: string;
-      kind: "provider";
-      source: string;
-      providerSource?: string;
-      insecure?: readonly string[];
-    } = {
+    const entry: PolicyEvidenceBuilder<PolicySecretEvidence> = {
       id,
       kind: "provider",
       source: `oc://openclaw.config/secrets/providers/${ocPathSegment(id)}`,
@@ -302,16 +244,13 @@ function scanPolicySecretProviders(cfg: Record<string, unknown>): readonly Polic
     if (isRecord(value) && typeof value.source === "string") {
       entry.providerSource = value.source;
     }
-    if (insecure.length > 0) {
-      entry.insecure = insecure;
-    }
     return entry;
   });
 }
 
 function scanPolicySecretInputs(cfg: Record<string, unknown>): readonly PolicySecretEvidence[] {
   const entries: PolicySecretEvidence[] = [];
-  const secrets = isRecord(cfg.secrets) ? cfg.secrets : {};
+  const secrets = asNonArrayRecord(cfg.secrets);
   collectSecretInputs(entries, cfg, [], secretRefDefaults(secrets.defaults));
   return entries;
 }
@@ -335,8 +274,8 @@ function collectSecretInputs(
     const childPath = [...path, key];
     const source = configPathSource(childPath);
     const secretInputPath = isSecretInputPath(childPath);
-    const ref = secretInputPath ? secretRefEvidence(child, defaults) : undefined;
-    if (ref !== undefined) {
+    const ref = secretInputPath ? coerceSecretRef(child, defaults) : null;
+    if (ref !== null) {
       entries.push({
         id: source,
         kind: "input",
@@ -513,20 +452,10 @@ function secretRefDefaults(value: unknown): SecretRefDefaults | undefined {
   if (typeof value.exec === "string") {
     defaults.exec = value.exec;
   }
+  if (typeof value.store === "string") {
+    defaults.store = value.store;
+  }
   return defaults;
-}
-
-function secretRefEvidence(
-  value: unknown,
-  defaults: SecretRefDefaults | undefined,
-): SecretRefEvidence | undefined {
-  const ref = coerceSecretRef(value, defaults);
-  return ref === null ? undefined : { source: ref.source, provider: ref.provider, id: ref.id };
-}
-
-function secretProviderInsecureFlags(value: unknown): readonly string[] {
-  void value;
-  return [];
 }
 
 function isValidAuthProfileMetadata(value: unknown): boolean {

@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { MemoryEntryProvenance } from "openclaw/plugin-sdk/memory-core-host-runtime-files";
+import { DEFAULT_MEMORY_DEEP_DREAMING_MAX_PROMOTED_SNIPPET_TOKENS } from "openclaw/plugin-sdk/memory-core-host-status";
+import { parseDateStringTimestampMs } from "openclaw/plugin-sdk/number-runtime";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeUniqueTrimmedStringList,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { deriveConceptTags, MAX_CONCEPT_TAGS } from "./concept-vocabulary.js";
 import type {
@@ -9,6 +15,8 @@ import type {
   ShortTermRecallStore,
 } from "./short-term-promotion-types.js";
 
+const GENERIC_DAY_HEADING_RE =
+  /^(?:(?:mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)(?:,\s+)?)?(?:(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}[/-]\d{2}[/-]\d{2})$/i;
 const SHORT_TERM_PATH_RE = /(?:^|\/)memory\/(?:[^/]+\/)*(\d{4})-(\d{2})-(\d{2})(?:-[^/]+)?\.md$/;
 const DREAMING_MEMORY_PATH_RE = /(?:^|\/)memory\/dreaming\//;
 const SHORT_TERM_SESSION_CORPUS_RE =
@@ -22,7 +30,8 @@ const DREAMING_TRANSCRIPT_PROMPT_LINE_RE =
   /\[[^\]]*dreaming-narrative[^\]]*]\s*(?:User|Assistant):\s*Write a dream diary entry from these memory fragments:?/i;
 const RAW_SESSION_METADATA_RE =
   /\bSession Key\b.{0,260}\bSession ID\b|\bSession ID\b.{0,260}\bSession Key\b/i;
-const RAW_CONVERSATION_SUMMARY_RE = /^(?:[-*+]\s*)?Conversation Summary:/i;
+const RAW_CONVERSATION_SUMMARY_RE =
+  /^(?:[-*+]\s*)?Conversation Summary:\s*(?:$|(?:[-*+]\s*)?(?:user|assistant|(?:\*\*)?Session (?:Key|ID)(?:\*\*)?):\s)/i;
 const RAW_TRANSCRIPT_TURN_RE = /^(?:[-*+]\s*)?(?:user|assistant):\s/i;
 const MEMORY_FLUSH_PROMPT_RE =
   /Save important context from this session to the daily memory file\.\s*STRICT RULES:/i;
@@ -56,12 +65,95 @@ export function toFiniteScore(value: unknown, fallback: number): number {
   return num;
 }
 
-export function normalizeSnippet(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return "";
+export function isGenericDailyHeading(heading: string): boolean {
+  const normalized = heading.trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return true;
   }
-  return trimmed.replace(/\s+/g, " ");
+  const lower = normalized.toLowerCase();
+  if (lower === "today" || lower === "yesterday" || lower === "tomorrow") {
+    return true;
+  }
+  if (lower === "morning" || lower === "afternoon" || lower === "evening" || lower === "night") {
+    return true;
+  }
+  return GENERIC_DAY_HEADING_RE.test(normalized);
+}
+
+export function normalizeSnippet(raw: string): string {
+  return raw.trim().replace(/\s+/g, " ");
+}
+
+const PROMOTED_SNIPPET_CHARS_PER_TOKEN_ESTIMATE = 4;
+
+function resolvePromotedSnippetCharLimit(maxTokens: number): number {
+  const tokenLimit = toFiniteNonNegativeInt(
+    maxTokens,
+    DEFAULT_MEMORY_DEEP_DREAMING_MAX_PROMOTED_SNIPPET_TOKENS,
+  );
+  // This is an inexpensive display-size guard, not a tokenizer contract.
+  return tokenLimit * PROMOTED_SNIPPET_CHARS_PER_TOKEN_ESTIMATE;
+}
+
+function truncatePromotedSnippet(snippet: string, maxTokens: number): string {
+  const limit = resolvePromotedSnippetCharLimit(maxTokens);
+  if (limit === 0 || snippet.length <= limit) {
+    return snippet;
+  }
+  const hardLimit = truncateUtf16Safe(snippet, limit);
+  const sentenceBoundary = Math.max(
+    hardLimit.lastIndexOf(". "),
+    hardLimit.lastIndexOf("! "),
+    hardLimit.lastIndexOf("? "),
+  );
+  const wordBoundary = hardLimit.lastIndexOf(" ");
+  const cutAt =
+    sentenceBoundary >= Math.floor(limit * 0.55)
+      ? sentenceBoundary + 1
+      : wordBoundary >= Math.floor(limit * 0.65)
+        ? wordBoundary
+        : limit;
+  return `${hardLimit.slice(0, cutAt).trimEnd()}...`;
+}
+
+export function formatPromotedSnippetForMemory(rawSnippet: string, maxTokens: number): string {
+  const normalized = normalizeSnippet(rawSnippet || "(no snippet captured)")
+    .replace(/^[-*+] +/, "")
+    .trim();
+  return truncatePromotedSnippet(normalized || "(no snippet captured)", maxTokens);
+}
+
+function normalizeProjectKeyList(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const keys = new Set<string>();
+  for (const rawKey of value.split(";")) {
+    const trimmed = rawKey.trim();
+    if (!trimmed || /[\r\n<>]/u.test(trimmed)) {
+      continue;
+    }
+    if (trimmed.startsWith("path:")) {
+      keys.add(trimmed);
+      continue;
+    }
+    const separator = trimmed.indexOf("/");
+    if (separator < 1) {
+      keys.add(trimmed);
+      continue;
+    }
+    // Preserve remote path case so case-sensitive hosts fail closed. Providers
+    // with case-insensitive slugs may miss boosts/digests across casing variants,
+    // but folding paths could cross-inject memory between distinct repositories.
+    keys.add(`${trimmed.slice(0, separator).toLowerCase()}${trimmed.slice(separator)}`);
+  }
+  return keys.size > 0 ? [...keys].join("; ") : undefined;
+}
+
+export function mergeProjectKeyLists(...values: unknown[]): string | undefined {
+  return normalizeProjectKeyList(
+    values.flatMap((value) => normalizeProjectKeyList(value)?.split(";") ?? []).join(";"),
+  );
 }
 
 export function truncateShortTermSnippet(snippet: string): string {
@@ -111,14 +203,10 @@ function hasDreamingNarrativeLead(snippet: string): boolean {
   if (/^(?:Candidate|Reflections?):/i.test(withoutPrefix)) {
     return true;
   }
-  // Managed dreaming blocks occasionally serialize recall metadata (status:/confidence:/
-  // evidence:/recalls:) inline before the Candidate or Reflections marker, so the
-  // start-of-string check misses shapes like "status: staged - Candidate: User: ...".
-  // The composite detector below still requires the full signal combination, so widening
-  // the lead check to anywhere in the first 200 chars closes the leak without creating
-  // false positives for ordinary durable notes that merely mention the word in prose.
-  const head = withoutPrefix.slice(0, 200);
-  return /\b(?:Candidate|Reflections?):/i.test(head);
+  // Serialized metadata can precede narrative markers; bound the scan to the lead.
+  // REM uses a Markdown heading instead of the staged block's colon marker.
+  const head = truncateUtf16Safe(withoutPrefix, 200);
+  return /\b(?:Candidate|Reflections?):/i.test(head) || /#{1,6}\s+Reflections?\b/i.test(head);
 }
 
 export function isContaminatedDreamingSnippet(
@@ -148,7 +236,13 @@ export function isContaminatedDreamingSnippet(
   );
   const hasStatus = /\bstatus:\s*staged\b/i.test(snippet);
   const hasRecalls = /\brecalls:\s*\d+\b/i.test(snippet);
-  return hasNarrativeLead && hasConfidence && hasEvidence && hasStatus && hasRecalls;
+  const hasReflectionNote = /\bnote:\s*reflection\b/i.test(snippet);
+  return (
+    hasNarrativeLead &&
+    hasConfidence &&
+    hasEvidence &&
+    ((hasStatus && hasRecalls) || hasReflectionNote)
+  );
 }
 
 export function normalizeMemoryPath(rawPath: string): string {
@@ -157,6 +251,10 @@ export function normalizeMemoryPath(rawPath: string): string {
 
 export function buildClaimHash(snippet: string): string {
   return createHash("sha1").update(normalizeSnippet(snippet)).digest("hex").slice(0, 12);
+}
+
+export function buildDailyClaimEntryKey(claimHash: string): string {
+  return `memory:claim:${claimHash}`;
 }
 
 export function buildEntryKey(result: {
@@ -177,47 +275,18 @@ export function hashQuery(query: string): string {
     .slice(0, 12);
 }
 
-export function mergeQueryHashes(existing: string[], queryHash: string): string[] {
-  if (!queryHash) {
-    return existing;
-  }
-  const seen = new Set<string>();
-  const next = existing.filter((value) => {
-    if (!value || seen.has(value)) {
-      return false;
-    }
-    seen.add(value);
-    return true;
-  });
-  if (!seen.has(queryHash)) {
-    next.push(queryHash);
-  }
-  if (next.length <= MAX_QUERY_HASHES) {
-    return next;
-  }
-  return next.slice(next.length - MAX_QUERY_HASHES);
-}
-
 export function mergeRecentDistinct(
   existing: string[],
   nextValue: string,
   limit: number,
 ): string[] {
-  const seen = new Set<string>();
-  const next = existing.filter((value): value is string => {
-    if (typeof value !== "string" || value.length === 0 || seen.has(value)) {
-      return false;
-    }
-    seen.add(value);
-    return true;
-  });
+  const next = [
+    ...new Set(existing.filter((value) => typeof value === "string" && value.length > 0)),
+  ];
   if (nextValue && !next.includes(nextValue)) {
     next.push(nextValue);
   }
-  if (next.length <= limit) {
-    return next;
-  }
-  return next.slice(next.length - limit);
+  return next.length <= limit ? next : next.slice(next.length - limit);
 }
 
 export function normalizeIsoDay(isoLike: string): string | null {
@@ -226,26 +295,6 @@ export function normalizeIsoDay(isoLike: string): string | null {
   }
   const match = isoLike.trim().match(/^(\d{4}-\d{2}-\d{2})/);
   return match?.[1] ?? null;
-}
-
-function normalizeDistinctStrings(values: unknown[], limit: number): string[] {
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const value of values) {
-    if (typeof value !== "string") {
-      continue;
-    }
-    const trimmed = value.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    normalized.push(trimmed);
-    if (normalized.length >= limit) {
-      break;
-    }
-  }
-  return normalized;
 }
 
 export function totalSignalCountForEntry(entry: {
@@ -304,6 +353,7 @@ export function normalizeShortTermRecallStore(raw: unknown, nowIso: string): Sho
         typeof entry.claimHash === "string" && entry.claimHash.trim().length > 0
           ? entry.claimHash.trim()
           : undefined;
+      const projectKey = normalizeProjectKeyList(entry.projectKey);
       const fullSnippet = typeof entry.snippet === "string" ? normalizeSnippet(entry.snippet) : "";
       if (
         fullSnippet &&
@@ -315,21 +365,65 @@ export function normalizeShortTermRecallStore(raw: unknown, nowIso: string): Sho
       }
       const snippet = truncateShortTermSnippet(fullSnippet);
       const queryHashes = Array.isArray(entry.queryHashes)
-        ? normalizeDistinctStrings(entry.queryHashes, MAX_QUERY_HASHES)
+        ? normalizeUniqueTrimmedStringList(entry.queryHashes).slice(0, MAX_QUERY_HASHES)
         : [];
+      const storedUserQueryHashes = Array.isArray(entry.userQueryHashes)
+        ? normalizeUniqueTrimmedStringList(entry.userQueryHashes).slice(0, MAX_QUERY_HASHES)
+        : undefined;
+      // Legacy rows did not retain query provenance. Rows containing only recall
+      // signals are unambiguous, so preserve their earned diversity; mixed rows
+      // stay unqualified until fresh interactive recalls arrive.
+      const userQueryHashes =
+        storedUserQueryHashes ??
+        (dailyCount === 0 && groundedCount === 0 ? queryHashes : undefined);
       const recallDays = Array.isArray(entry.recallDays)
         ? entry.recallDays
             .map((recallDay) => (typeof recallDay === "string" ? normalizeIsoDay(recallDay) : null))
             .filter((valueLocal): valueLocal is string => valueLocal !== null)
         : [];
       const conceptTags = Array.isArray(entry.conceptTags)
-        ? normalizeDistinctStrings(
+        ? normalizeUniqueTrimmedStringList(
             entry.conceptTags.map((tag) =>
               typeof tag === "string" ? normalizeLowercaseStringOrEmpty(tag) : tag,
             ),
-            MAX_CONCEPT_TAGS,
-          )
+          ).slice(0, MAX_CONCEPT_TAGS)
         : deriveConceptTags({ path: entryPath, snippet: fullSnippet });
+      const provenanceRaw =
+        entry.provenance && typeof entry.provenance === "object"
+          ? (entry.provenance as Record<string, unknown>)
+          : undefined;
+      const lastObservedAt = Date.parse(lastRecalledAt);
+      const fallbackObservedAt = Number.isFinite(lastObservedAt)
+        ? lastObservedAt
+        : Date.parse(nowIso);
+      const provenance: MemoryEntryProvenance | undefined = provenanceRaw
+        ? {
+            originClass:
+              provenanceRaw.originClass === "owner" ||
+              provenanceRaw.originClass === "agent" ||
+              provenanceRaw.originClass === "system" ||
+              provenanceRaw.originClass === "untrusted"
+                ? provenanceRaw.originClass
+                : "untrusted",
+            sessionKind:
+              provenanceRaw.sessionKind === "interactive" ||
+              provenanceRaw.sessionKind === "cron" ||
+              provenanceRaw.sessionKind === "heartbeat" ||
+              provenanceRaw.sessionKind === "subagent" ||
+              provenanceRaw.sessionKind === "unknown"
+                ? provenanceRaw.sessionKind
+                : "unknown",
+            observedAt:
+              typeof provenanceRaw.observedAt === "number" &&
+              Number.isFinite(provenanceRaw.observedAt)
+                ? provenanceRaw.observedAt
+                : fallbackObservedAt,
+            ...(typeof provenanceRaw.supersedesKey === "string" &&
+            provenanceRaw.supersedesKey.trim()
+              ? { supersedesKey: provenanceRaw.supersedesKey.trim() }
+              : {}),
+          }
+        : undefined;
 
       const normalizedKey =
         key || buildEntryKey({ path: entryPath, startLine, endLine, source, claimHash });
@@ -348,9 +442,12 @@ export function normalizeShortTermRecallStore(raw: unknown, nowIso: string): Sho
         firstRecalledAt,
         lastRecalledAt,
         queryHashes,
+        ...(userQueryHashes ? { userQueryHashes } : {}),
         recallDays: recallDays.slice(-MAX_RECALL_DAYS),
         conceptTags,
+        ...(provenance ? { provenance } : {}),
         ...(claimHash ? { claimHash } : {}),
+        ...(projectKey ? { projectKey } : {}),
         ...(promotedAt ? { promotedAt } : {}),
       };
     }
@@ -364,14 +461,13 @@ export function normalizeShortTermRecallStore(raw: unknown, nowIso: string): Sho
 }
 
 export function parseStoreTimestampMs(value: string | undefined): number {
-  if (!value) {
-    return Number.NEGATIVE_INFINITY;
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+  return parseDateStringTimestampMs(value) ?? Number.NEGATIVE_INFINITY;
 }
 
-function compareStoreTimestampDesc(left: string | undefined, right: string | undefined): number {
+export function compareStoreTimestampDesc(
+  left: string | undefined,
+  right: string | undefined,
+): number {
   const leftMs = parseStoreTimestampMs(left);
   const rightMs = parseStoreTimestampMs(right);
   if (leftMs === rightMs) {
@@ -424,7 +520,7 @@ export function toFinitePositive(value: unknown, fallback: number): number {
   return num;
 }
 
-export function toFiniteNonNegativeInt(value: unknown, fallback: number): number {
+export function toFiniteNonNegativeInt(value: unknown, fallback = 0): number {
   const num = Number(value);
   if (!Number.isFinite(num)) {
     return fallback;
@@ -499,29 +595,21 @@ export function normalizeMemoryPathForWorkspace(workspaceDir: string, rawPath: s
   return normalized;
 }
 
-export function toNonNegativeInt(value: unknown): number {
-  const num = Number(value);
-  if (!Number.isFinite(num)) {
-    return 0;
-  }
-  return Math.max(0, Math.floor(num));
-}
-
 export function parseEntryRangeFromKey(
   key: string,
   fallbackStartLine: unknown,
   fallbackEndLine: unknown,
 ): { startLine: number; endLine: number } {
-  const startLine = toNonNegativeInt(fallbackStartLine);
-  const endLine = toNonNegativeInt(fallbackEndLine);
+  const startLine = toFiniteNonNegativeInt(fallbackStartLine);
+  const endLine = toFiniteNonNegativeInt(fallbackEndLine);
   if (startLine > 0 && endLine > 0) {
     return { startLine, endLine };
   }
   const match = key.match(/:(\d+):(\d+)$/);
   if (match) {
     return {
-      startLine: Math.max(1, toNonNegativeInt(match[1])),
-      endLine: Math.max(1, toNonNegativeInt(match[2])),
+      startLine: Math.max(1, toFiniteNonNegativeInt(match[1])),
+      endLine: Math.max(1, toFiniteNonNegativeInt(match[2])),
     };
   }
   return { startLine: 1, endLine: 1 };

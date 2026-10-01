@@ -1,3 +1,4 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 /**
  * Shared MCP config coercion helpers.
  *
@@ -42,11 +43,6 @@ function isDangerousMcpStdioEnvVarName(rawKey: string): boolean {
   return isDangerousHostInheritedEnvVarName(key);
 }
 
-/** Returns whether a value is a plain MCP config record. */
-export function isMcpConfigRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 function toMcpFilteredStringRecord(
   value: unknown,
   options?: {
@@ -55,7 +51,7 @@ function toMcpFilteredStringRecord(
     shouldDropKey?: (key: string) => boolean;
   },
 ): Record<string, string> | undefined {
-  if (!isMcpConfigRecord(value)) {
+  if (!isRecord(value)) {
     return undefined;
   }
   let droppedByKey = false;
@@ -101,13 +97,4 @@ export function toMcpEnvRecord(
     preserveEmptyWhenKeysDropped: true,
     shouldDropKey: (key) => isDangerousMcpStdioEnvVarName(key),
   });
-}
-
-/** Coerces an MCP string-array config value, dropping non-string entries. */
-export function toMcpStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const entries = value.filter((entry): entry is string => typeof entry === "string");
-  return entries.length > 0 ? entries : [];
 }

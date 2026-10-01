@@ -1,5 +1,6 @@
 // Performs lightweight safe-regex checks for user-supplied patterns.
 import { expectDefined } from "@openclaw/normalization-core";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
 type QuantifierRead = {
   consumed: number;
   minRepeat: number;
@@ -330,15 +331,9 @@ export function compileSafeRegexDetailed(source: string, flags = ""): SafeRegexC
     return { regex: null, source: trimmed, flags, reason: "empty" };
   }
   const cacheKey = `${flags}::${trimmed}`;
-  if (safeRegexCache.has(cacheKey)) {
-    return (
-      safeRegexCache.get(cacheKey) ?? {
-        regex: null,
-        source: trimmed,
-        flags,
-        reason: "invalid-regex",
-      }
-    );
+  const cached = safeRegexCache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
 
   let result: SafeRegexCompileResult;
@@ -353,12 +348,7 @@ export function compileSafeRegexDetailed(source: string, flags = ""): SafeRegexC
   }
 
   safeRegexCache.set(cacheKey, result);
-  if (safeRegexCache.size > SAFE_REGEX_CACHE_MAX) {
-    const oldestKey = safeRegexCache.keys().next().value;
-    if (oldestKey) {
-      safeRegexCache.delete(oldestKey);
-    }
-  }
+  pruneMapToMaxSize(safeRegexCache, SAFE_REGEX_CACHE_MAX);
   return result;
 }
 

@@ -12,6 +12,9 @@ type PluginSdkDocMetadata = {
 };
 
 export const pluginSdkDocMetadata = {
+  "control-ui-link-reader": {
+    category: "core",
+  },
   core: {
     category: "core",
   },
@@ -57,7 +60,7 @@ export const pluginSdkDocMetadata = {
   "channel-ingress-runtime": {
     category: "channel",
   },
-  "channel-reply-pipeline": {
+  "channel-outbound": {
     category: "channel",
   },
   "channel-setup": {
@@ -84,13 +87,25 @@ export const pluginSdkDocMetadata = {
   "runtime-store": {
     category: "runtime",
   },
+  "plugin-command-runtime": {
+    category: "runtime",
+  },
   "session-store-runtime": {
+    category: "runtime",
+  },
+  "conversation-binding-inspection-runtime": {
+    category: "runtime",
+  },
+  "agent-scope-runtime": {
     category: "runtime",
   },
   "agent-runtime": {
     category: "runtime",
   },
   "agent-harness-runtime": {
+    category: "runtime",
+  },
+  "agent-workspace-runtime": {
     category: "runtime",
   },
   "speech-settings": {

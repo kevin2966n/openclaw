@@ -13,6 +13,9 @@ const mocks = vi.hoisted(() => ({
       },
     },
     diagnostics: [],
+    prepareDataDirsByServer: {
+      bundleProbe: { pluginId: "bundle-probe", dataDir: "/state/plugin-data/bundle-probe" },
+    },
   },
 }));
 
@@ -45,6 +48,18 @@ describe("loadMergedBundleMcpConfig", () => {
       transport: "streamable-http",
       url: "https://mcp.example.com/mcp",
     });
+    expect(merged.prepareDataDirsByServer).toStrictEqual({});
+  });
+
+  it("preserves Agent Plugins launch ownership for unshadowed bundle servers", () => {
+    const merged = loadMergedBundleMcpConfig({
+      workspaceDir: "/workspace",
+    });
+
+    expect(merged.config.mcpServers.bundleProbe).toMatchObject({ command: "node" });
+    expect(merged.prepareDataDirsByServer).toEqual({
+      bundleProbe: { pluginId: "bundle-probe", dataDir: "/state/plugin-data/bundle-probe" },
+    });
   });
 
   it("maps OpenClaw transports to downstream CLI types when requested", () => {
@@ -58,7 +73,10 @@ describe("loadMergedBundleMcpConfig", () => {
       url: "https://mcp.example.com/mcp",
     });
     expect(toCliBundleMcpServerConfig({ type: "sse", transport: "streamable-http" })).toEqual({
-      type: "sse",
+      type: "http",
+    });
+    expect(toCliBundleMcpServerConfig({ type: " CuStOm ", transport: "custom" })).toEqual({
+      type: " CuStOm ",
     });
   });
 
@@ -96,5 +114,41 @@ describe("loadMergedBundleMcpConfig", () => {
     });
 
     expect(merged.config.mcpServers).not.toHaveProperty("bundleProbe");
+    expect(merged.prepareDataDirsByServer).toStrictEqual({});
+  });
+
+  it.each([
+    {
+      name: "excludes an enabled server",
+      override: false,
+      enabled: true,
+      expected: false,
+    },
+    {
+      name: "includes a disabled server",
+      override: true,
+      enabled: false,
+      expected: true,
+    },
+    {
+      name: "inherits configured state",
+      override: undefined,
+      enabled: true,
+      expected: true,
+    },
+  ])("$name", ({ override, enabled, expected }) => {
+    const merged = loadMergedBundleMcpConfig({
+      workspaceDir: "/workspace",
+      cfg: {
+        mcp: {
+          servers: {
+            docs: { enabled, command: "node", args: ["docs.mjs"] },
+          },
+        },
+      },
+      ...(override === undefined ? {} : { toolOverrides: { mcpServers: { docs: override } } }),
+    });
+
+    expect(Object.hasOwn(merged.config.mcpServers, "docs")).toBe(expected);
   });
 });

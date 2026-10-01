@@ -55,6 +55,32 @@ class ChatComposerDraftTest {
   }
 
   @Test
+  fun pendingPickerImportBlocksOnlyItsComposerAndCancellationRestoresSend() {
+    val owner = ChatComposerOwner("gateway", "main", "agent:main:first")
+    val sibling = owner.copy(sessionKey = "agent:main:second")
+    val state = ChatComposerStateStore()
+    state.textDrafts[owner] = "Caption waiting for a picked file"
+    state.textDrafts[sibling] = "Independent caption"
+    val authorization = requireNotNull(state.beginMediaAcquisition(owner))
+    val importId = requireNotNull(state.beginMediaImport(owner, authorization, "agent:main:first"))
+    val secondAuthorization = requireNotNull(state.beginMediaAcquisition(owner))
+    val secondImportId = requireNotNull(state.beginMediaImport(owner, secondAuthorization, "agent:main:first"))
+
+    assertEquals(ChatComposerSendStartResult.Unavailable, state.beginSend(owner).result)
+    assertEquals("Caption waiting for a picked file", state.textDrafts[owner])
+    val independent = requireNotNull(state.beginSend(sibling).request)
+    assertEquals("Independent caption", independent.message)
+    state.completeSend(independent, accepted = false)
+
+    state.cancelMediaImport(importId)
+    assertEquals(ChatComposerSendStartResult.Unavailable, state.beginSend(owner).result)
+    state.cancelMediaImport(secondImportId)
+    val afterCancel = requireNotNull(state.beginSend(owner).request)
+    assertEquals("Caption waiting for a picked file", afterCancel.message)
+    assertTrue(afterCancel.attachments.isEmpty())
+  }
+
+  @Test
   fun sendPayloadReadsCurrentOwnerStoresAfterEditsAndRemovals() {
     val owner = ChatComposerOwner(gatewayStableId = "gateway-a", agentId = "main", sessionKey = "agent:main:first")
     val state = ChatComposerStateStore()
@@ -300,9 +326,8 @@ class ChatComposerDraftTest {
     val longDraft = "x".repeat(40_000)
     owners.forEach { owner -> store[owner] = longDraft }
 
-    assertEquals(CHAT_COMPOSER_MAX_DRAFT_OWNERS, store.size())
     assertEquals("", store[owners.first()])
-    assertEquals(longDraft, store[owners.last()])
+    owners.drop(1).forEach { owner -> assertEquals(longDraft, store[owner]) }
     assertTrue(saved.sumOf(String::length) <= CHAT_COMPOSER_DRAFT_SNAPSHOT_MAX_CHARS)
     assertEquals(longDraft, ChatComposerTextDraftStore(initial = chatComposerTextDraftsFromSnapshot(saved))[owners.last()])
   }
@@ -716,7 +741,29 @@ class ChatComposerDraftTest {
   fun attachmentAdmissionUsesPerKindDecodedBudgets() {
     assertEquals(CHAT_COMPOSER_MAX_IMAGE_DECODED_BYTES, chatComposerAttachmentDecodedByteLimit("image/png"))
     assertEquals(CHAT_COMPOSER_MAX_AUDIO_DECODED_BYTES, chatComposerAttachmentDecodedByteLimit("audio/mpeg"))
+    assertEquals(CHAT_COMPOSER_MAX_VIDEO_DECODED_BYTES, chatComposerAttachmentDecodedByteLimit("video/mp4"))
     assertEquals(CHAT_COMPOSER_MAX_DOCUMENT_DECODED_BYTES, chatComposerAttachmentDecodedByteLimit("application/pdf"))
+    assertEquals(20L * 1024L * 1024L, CHAT_COMPOSER_MAX_VIDEO_DECODED_BYTES)
+  }
+
+  @Test
+  fun videoPositionDoesNotRelaxNonVideoAdmissionBudget() {
+    val video = PendingAttachment("video", "clip.mp4", "video/mp4", "AAAA")
+    val document = PendingAttachment("document", "report.pdf", "application/pdf", "AAAAAAAA")
+
+    fun admit(candidates: List<PendingAttachment>) =
+      admitChatAttachments(
+        currentAttachments = emptyList(),
+        candidates = candidates,
+        maxAttachmentCount = 8,
+        maxBase64Chars = 100,
+        maxDecodedBytes = 9,
+        maxNonVideoBase64Chars = 100,
+        maxNonVideoDecodedBytes = 3,
+      )
+
+    assertEquals(listOf(video), admit(listOf(video, document)).accepted)
+    assertEquals(listOf(video), admit(listOf(document, video)).accepted)
   }
 
   @Test
@@ -732,7 +779,7 @@ class ChatComposerDraftTest {
 
   @Test
   fun pendingAttachmentsRemainKeyedAcrossComposerNavigationAndOwnerResolution() {
-    val ownerA = ChatComposerOwner(gatewayStableId = "gateway", agentId = "agent-a", sessionKey = "session-a")
+    val ownerA = ChatComposerOwner(gatewayStableId = "gateway", agentId = "agent-a", sessionKey = "main")
     val ownerB = ChatComposerOwner(gatewayStableId = "gateway", agentId = "agent-b", sessionKey = "session-b")
     val resolvedA = ownerA.copy(sessionKey = "agent:agent-a:device")
     val store = ChatComposerAttachmentStore()
@@ -746,7 +793,7 @@ class ChatComposerDraftTest {
     assertEquals(listOf(first), store.attachments.value[ownerA])
     assertEquals(listOf(second), store.attachments.value[ownerB])
 
-    store.migrate(ownerA, resolvedA)
+    store.migrateMatching(resolvedA, resolvedA.sessionKey)
     assertEquals(null, store.attachments.value[ownerA])
     assertEquals(listOf(first), store.attachments.value[resolvedA])
     assertEquals(listOf(second), store.attachments.value[ownerB])
@@ -838,11 +885,11 @@ class ChatComposerDraftTest {
     store.add(to, destination)
     store.add(from, source)
 
-    assertEquals(1, store.migrate(from, to))
+    assertEquals(1, store.migrateMatching(to, to.sessionKey).omittedCount)
     assertEquals(CHAT_COMPOSER_MAX_ATTACHMENTS, store.attachments.value[to]?.size)
     assertEquals(null, store.attachments.value[from])
     store.remove(to, store.get(to).mapTo(mutableSetOf()) { it.id })
-    assertEquals(0, store.migrate(from, to))
+    assertEquals(0, store.migrateMatching(to, to.sessionKey).omittedCount)
     assertEquals(null, store.attachments.value[to])
   }
 
@@ -957,7 +1004,7 @@ class ChatComposerDraftTest {
     assertFalse(
       chatComposerSendEnabled(
         voiceNoteState = VoiceNoteRecorderState.Idle,
-        pendingRunCount = 0,
+        talkActive = false,
         hasContent = true,
         shareStaging = true,
         sendInFlight = false,
@@ -966,7 +1013,7 @@ class ChatComposerDraftTest {
     assertTrue(
       chatComposerSendEnabled(
         voiceNoteState = VoiceNoteRecorderState.Idle,
-        pendingRunCount = 0,
+        talkActive = false,
         hasContent = true,
         shareStaging = false,
         sendInFlight = false,
@@ -975,7 +1022,7 @@ class ChatComposerDraftTest {
     assertFalse(
       chatComposerSendEnabled(
         voiceNoteState = VoiceNoteRecorderState.Idle,
-        pendingRunCount = 0,
+        talkActive = false,
         hasContent = true,
         shareStaging = false,
         sendInFlight = true,
@@ -988,10 +1035,23 @@ class ChatComposerDraftTest {
     assertFalse(
       chatComposerSendEnabled(
         voiceNoteState = VoiceNoteRecorderState.Idle,
-        pendingRunCount = 0,
+        talkActive = false,
         hasContent = true,
         shareStaging = false,
         dictationActive = true,
+      ),
+    )
+  }
+
+  @Test
+  fun sendIsDisabledForAPermanentlyUnavailableModel() {
+    assertFalse(
+      chatComposerSendEnabled(
+        voiceNoteState = VoiceNoteRecorderState.Idle,
+        talkActive = false,
+        hasContent = true,
+        shareStaging = false,
+        modelUnavailable = true,
       ),
     )
   }

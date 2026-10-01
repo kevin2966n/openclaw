@@ -2,14 +2,16 @@ import type { LogRecord, SeverityNumber } from "@opentelemetry/api-logs";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
 import type { Resource } from "@opentelemetry/resources";
 import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
-import type { DiagnosticEventMetadata, DiagnosticEventPayload } from "../api.js";
+import type {
+  DiagnosticEventMetadata,
+  DiagnosticEventPayload,
+} from "openclaw/plugin-sdk/diagnostic-runtime";
 import {
   assignOtelLogAttribute,
   assignOtelLogEventAttributes,
   assignOtelSecurityAttributes,
   redactOtelAttributes,
   securitySeverityText,
-  shouldCaptureOtelLogBody,
   writeStdoutDiagnosticLogRecord,
 } from "./service-attributes.js";
 import {
@@ -20,7 +22,8 @@ import {
   normalizeOtelLogString,
   type OtelContentCapturePolicy,
 } from "./service-content-normalization.js";
-import { errorCategory, formatError, resolveOtelHttpAgentOptions } from "./service-exporter.js";
+import { observeOtlpExporterHealth, type ExporterHealthUpdate } from "./service-exporter-health.js";
+import { errorCategory, formatError } from "./service-exporter.js";
 import {
   addTraceAttributes,
   contextForTrustedTraceContext,
@@ -28,8 +31,9 @@ import {
 } from "./service-trace-context.js";
 import type {
   BuiltOtelLogRecord,
+  OtelHttpAgentFactory,
+  OtelHttpAgentOptions,
   OtelLogger,
-  TelemetryExporterDiagnosticEvent,
 } from "./service-types.js";
 
 const LOG_SEVERITY_MAP: Record<string, SeverityNumber> = {
@@ -43,13 +47,14 @@ const LOG_SEVERITY_MAP: Record<string, SeverityNumber> = {
 
 export function createDiagnosticsLogExporter(params: {
   contentCapturePolicy: OtelContentCapturePolicy;
-  emitExporterEvent: (event: Omit<TelemetryExporterDiagnosticEvent, "type" | "seq" | "ts">) => void;
+  emitExporterEvent: (event: ExporterHealthUpdate) => void;
   flushIntervalMs?: number;
   headers?: Record<string, string>;
   logger: OtelLogger;
   logsEnabled: boolean;
   logsToOtlp: boolean;
   logsToStdout: boolean;
+  logHttpAgentOptions?: OtelHttpAgentFactory | OtelHttpAgentOptions;
   logUrl?: string;
   resource: Resource;
   serviceName: string;
@@ -63,12 +68,12 @@ export function createDiagnosticsLogExporter(params: {
     logsEnabled,
     logsToOtlp,
     logsToStdout,
+    logHttpAgentOptions,
     logUrl,
     resource,
     serviceName,
   } = params;
   let logProvider: LoggerProvider | null = null;
-  const logSeverityMap = LOG_SEVERITY_MAP;
   let recordLogRecord:
     | ((
         evt: Extract<DiagnosticEventPayload, { type: "log.record" }>,
@@ -83,19 +88,20 @@ export function createDiagnosticsLogExporter(params: {
     | undefined;
   if (logsEnabled) {
     let logRecordExportFailureLastReportedAt = Number.NEGATIVE_INFINITY;
-
     let otelLogger: { emit: (logRecord: LogRecord) => void } | undefined;
+    const activeTransports: ExporterHealthUpdate["transport"][] = [
+      ...(logsToOtlp ? (["otlp-http-protobuf"] as const) : []),
+      ...(logsToStdout ? (["stdout"] as const) : []),
+    ];
     if (logsToOtlp) {
-      const logHttpAgentOptions = resolveOtelHttpAgentOptions({
-        url: logUrl,
-        signalIdentifier: "LOGS",
-        logger,
-      });
-      const logExporter = new OTLPLogExporter({
-        ...(logUrl ? { url: logUrl } : {}),
-        ...(headers ? { headers } : {}),
-        ...(logHttpAgentOptions ? { httpAgentOptions: logHttpAgentOptions } : {}),
-      });
+      const logExporter = observeOtlpExporterHealth(
+        new OTLPLogExporter({
+          ...(logUrl ? { url: logUrl } : {}),
+          ...(headers ? { headers } : {}),
+          ...(logHttpAgentOptions ? { httpAgentOptions: logHttpAgentOptions } : {}),
+        }),
+        { emitExporterEvent, signal: "logs" },
+      );
       const logProcessor = new BatchLogRecordProcessor({
         exporter: logExporter,
         ...(typeof flushIntervalMs === "number"
@@ -109,10 +115,15 @@ export function createDiagnosticsLogExporter(params: {
       otelLogger = logProvider.getLogger("openclaw");
     }
 
-    const reportLogExportFailure = (err: unknown, label: "log record" | "security event") => {
+    const reportLogExportFailure = (
+      err: unknown,
+      label: "log record" | "security event",
+      transport: ExporterHealthUpdate["transport"],
+    ) => {
       emitExporterEvent({
         exporter: "diagnostics-otel",
         signal: "logs",
+        transport,
         status: "failure",
         reason: "emit_failed",
         errorCategory: errorCategory(err),
@@ -126,17 +137,44 @@ export function createDiagnosticsLogExporter(params: {
         logger.error(`diagnostics-otel: ${label} export failed: ${formatError(err)}`);
       }
     };
+    const reportLogExportRecovery = (transport: ExporterHealthUpdate["transport"]) => {
+      emitExporterEvent({
+        exporter: "diagnostics-otel",
+        signal: "logs",
+        transport,
+        status: "recovered",
+        reason: "emit_failed",
+      });
+    };
+    const reportLogPreparationFailure = (err: unknown, label: "log record" | "security event") => {
+      for (const transport of activeTransports) {
+        reportLogExportFailure(err, label, transport);
+      }
+    };
 
-    const emitLogRecord = ({ logRecord, traceContext }: BuiltOtelLogRecord) => {
+    const emitLogRecord = (
+      { logRecord, traceContext }: BuiltOtelLogRecord,
+      label: "log record" | "security event",
+    ) => {
       if (logsToOtlp) {
-        otelLogger?.emit(logRecord);
+        try {
+          otelLogger?.emit(logRecord);
+          reportLogExportRecovery("otlp-http-protobuf");
+        } catch (error) {
+          reportLogExportFailure(error, label, "otlp-http-protobuf");
+        }
       }
       if (logsToStdout) {
-        writeStdoutDiagnosticLogRecord({
-          logRecord,
-          serviceName,
-          ...(traceContext ? { traceContext } : {}),
-        });
+        try {
+          writeStdoutDiagnosticLogRecord({
+            logRecord,
+            serviceName,
+            ...(traceContext ? { traceContext } : {}),
+          });
+          reportLogExportRecovery("stdout");
+        } catch (error) {
+          reportLogExportFailure(error, label, "stdout");
+        }
       }
     };
 
@@ -145,8 +183,8 @@ export function createDiagnosticsLogExporter(params: {
       metadata: DiagnosticEventMetadata,
     ): BuiltOtelLogRecord => {
       const logLevelName = evt.level || "INFO";
-      const severityNumber = logSeverityMap[logLevelName] ?? (9 as SeverityNumber);
-      const body = shouldCaptureOtelLogBody(contentCapturePolicy)
+      const severityNumber = LOG_SEVERITY_MAP[logLevelName] ?? (9 as SeverityNumber);
+      const body = contentCapturePolicy.logBodies
         ? normalizeOtelLogString(evt.message || "log", MAX_OTEL_LOG_BODY_CHARS)
         : "log";
       const attributes = Object.create(null) as Record<string, string | number | boolean>;
@@ -193,7 +231,7 @@ export function createDiagnosticsLogExporter(params: {
       const logRecord: LogRecord = {
         body: "openclaw.security.event",
         severityText,
-        severityNumber: logSeverityMap[severityText] ?? (9 as SeverityNumber),
+        severityNumber: LOG_SEVERITY_MAP[severityText] ?? (9 as SeverityNumber),
         attributes: redactOtelAttributes(attributes),
         timestamp: evt.ts,
       };
@@ -206,9 +244,10 @@ export function createDiagnosticsLogExporter(params: {
 
     recordLogRecord = (evt, metadata) => {
       try {
-        emitLogRecord(buildDiagnosticLogRecord(evt, metadata));
+        const record = buildDiagnosticLogRecord(evt, metadata);
+        emitLogRecord(record, "log record");
       } catch (err) {
-        reportLogExportFailure(err, "log record");
+        reportLogPreparationFailure(err, "log record");
       }
     };
     recordSecurityEvent = (evt, metadata) => {
@@ -216,9 +255,10 @@ export function createDiagnosticsLogExporter(params: {
         return;
       }
       try {
-        emitLogRecord(buildSecurityLogRecord(evt, metadata));
+        const record = buildSecurityLogRecord(evt, metadata);
+        emitLogRecord(record, "security event");
       } catch (err) {
-        reportLogExportFailure(err, "security event");
+        reportLogPreparationFailure(err, "security event");
       }
     };
   }

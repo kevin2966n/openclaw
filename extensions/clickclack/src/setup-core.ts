@@ -1,4 +1,3 @@
-// ClickClack plugin module implements non-interactive setup behavior.
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import {
   defineChannelSetupContract,
@@ -9,9 +8,9 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
   applyAccountNameToChannelSection,
-  applySetupAccountConfigPatch,
-  migrateBaseNameToDefaultAccount,
   moveSingleAccountChannelSectionToDefaultAccount,
+  patchScopedAccountConfig,
+  prepareScopedSetupConfig,
 } from "openclaw/plugin-sdk/setup";
 import { createSetupInputPresenceValidator } from "openclaw/plugin-sdk/setup-runtime";
 import { resolveClickClackAccountConfig } from "./accounts.js";
@@ -85,6 +84,7 @@ function parseClickClackSetupCodeInput(params: { code: string; baseUrl?: string 
 
   let code = rawCode;
   let baseUrl: string;
+  let exactClaimUrl: string | undefined;
   if (/^[a-z][a-z\d+.-]*:\/\//iu.test(rawCode)) {
     let setupUrl: URL;
     try {
@@ -106,7 +106,6 @@ function parseClickClackSetupCodeInput(params: { code: string; baseUrl?: string 
       throw new Error("ClickClack setup URL is missing its #CODE fragment.");
     }
     setupUrl.hash = "";
-    let exactClaimUrl: string | undefined;
     if (setupUrl.pathname.endsWith(CLICKCLACK_SETUP_CODE_CLAIM_PATH)) {
       const exactEndpoint = requireClickClackSetupClaimUrl(setupUrl.toString());
       baseUrl = exactEndpoint.apiBaseUrl;
@@ -120,24 +119,19 @@ function parseClickClackSetupCodeInput(params: { code: string; baseUrl?: string 
         throw new Error("ClickClack --base-url does not match the server in the setup-code URL.");
       }
     }
-    const normalizedCode = normalizeClickClackSetupCode(code);
-    if (!normalizedCode) {
-      throw new Error("ClickClack setup code must contain 12 valid base32 characters.");
+  } else {
+    code = code.startsWith("#") ? code.slice(1) : code;
+    if (!params.baseUrl) {
+      throw new Error("A bare ClickClack setup code requires --base-url.");
     }
-    return { code: normalizedCode, baseUrl, ...(exactClaimUrl ? { exactClaimUrl } : {}) };
+    baseUrl = requireClickClackSetupCodeBaseUrl(params.baseUrl);
   }
-
-  code = code.startsWith("#") ? code.slice(1) : code;
-  if (!params.baseUrl) {
-    throw new Error("A bare ClickClack setup code requires --base-url.");
-  }
-  baseUrl = requireClickClackSetupCodeBaseUrl(params.baseUrl);
 
   const normalizedCode = normalizeClickClackSetupCode(code);
   if (!normalizedCode) {
     throw new Error("ClickClack setup code must contain 12 valid base32 characters.");
   }
-  return { code: normalizedCode, baseUrl };
+  return { code: normalizedCode, baseUrl, ...(exactClaimUrl ? { exactClaimUrl } : {}) };
 }
 
 function formatClickClackSetupCodeClaimError(error: unknown): Error {
@@ -160,6 +154,7 @@ export function applyClickClackSetupConfigPatch(params: {
   accountId: string;
   name?: string;
   patch: Record<string, unknown>;
+  clearFields?: readonly string[];
 }): OpenClawConfig {
   const accountId = normalizeAccountId(params.accountId);
   const scopedConfig =
@@ -170,73 +165,19 @@ export function applyClickClackSetupConfigPatch(params: {
           channelKey: channel,
           setupSurface: clickClackSetupAdapter,
         });
-  const namedConfig = applyAccountNameToChannelSection({
-    cfg: scopedConfig,
-    channelKey: channel,
-    accountId,
-    name: params.name,
-  });
-  const next =
-    accountId !== DEFAULT_ACCOUNT_ID
-      ? migrateBaseNameToDefaultAccount({
-          cfg: namedConfig,
-          channelKey: channel,
-        })
-      : namedConfig;
-  return applySetupAccountConfigPatch({
-    cfg: next,
+  return patchScopedAccountConfig({
+    cfg: prepareScopedSetupConfig({
+      cfg: scopedConfig,
+      channelKey: channel,
+      accountId,
+      name: params.name,
+      migrateBaseName: accountId !== DEFAULT_ACCOUNT_ID,
+    }),
     channelKey: channel,
     accountId,
     patch: params.patch,
+    ...(params.clearFields ? { clearFields: params.clearFields } : {}),
   });
-}
-
-function clearClickClackSetupConfigFields(params: {
-  cfg: OpenClawConfig;
-  accountId: string;
-  fields: string[];
-}): OpenClawConfig {
-  const clickclack = (params.cfg.channels as Record<string, unknown> | undefined)?.clickclack as
-    | (Record<string, unknown> & { accounts?: Record<string, Record<string, unknown>> })
-    | undefined;
-  if (!clickclack) {
-    return params.cfg;
-  }
-  const accountId = normalizeAccountId(params.accountId);
-  if (accountId === DEFAULT_ACCOUNT_ID) {
-    const nextClickClack = { ...clickclack };
-    for (const field of params.fields) {
-      delete nextClickClack[field];
-    }
-    return {
-      ...params.cfg,
-      channels: {
-        ...params.cfg.channels,
-        clickclack: nextClickClack,
-      },
-    } as OpenClawConfig;
-  }
-  const currentAccount = clickclack.accounts?.[accountId];
-  if (!currentAccount) {
-    return params.cfg;
-  }
-  const nextAccount = { ...currentAccount };
-  for (const field of params.fields) {
-    delete nextAccount[field];
-  }
-  return {
-    ...params.cfg,
-    channels: {
-      ...params.cfg.channels,
-      clickclack: {
-        ...clickclack,
-        accounts: {
-          ...clickclack.accounts,
-          [accountId]: nextAccount,
-        },
-      },
-    },
-  } as OpenClawConfig;
 }
 
 export function applyClickClackCredentialConfig(params: {
@@ -253,9 +194,10 @@ export function applyClickClackCredentialConfig(params: {
       : params.token !== undefined
         ? ["tokenFile"]
         : [];
-  const next = applyClickClackSetupConfigPatch({
+  return applyClickClackSetupConfigPatch({
     cfg: params.cfg,
     accountId: params.accountId,
+    clearFields: fieldsToClear,
     patch: params.useEnv
       ? {}
       : params.tokenFile
@@ -264,24 +206,18 @@ export function applyClickClackCredentialConfig(params: {
           ? { token: params.token }
           : {},
   });
-  return clearClickClackSetupConfigFields({
-    cfg: next,
-    accountId: params.accountId,
-    fields: fieldsToClear,
-  });
 }
 
-export const clickClackSetupAdapter: ChannelSetupAdapter = {
+const clickClackSetupAdapter: ChannelSetupAdapter<ClickClackSetupInput> = {
   resolveAccountId: ({ accountId }) => normalizeAccountId(accountId),
-  prepareAccountConfigInput: async ({ cfg, accountId, input }) => {
-    const setupInput = input as ClickClackSetupInput;
+  prepareAccountConfigInput: async ({ cfg, accountId, input: setupInput }) => {
     if (!setupInput.code?.trim()) {
       return setupInput;
     }
     if (setupInput.token?.trim() || setupInput.tokenFile?.trim() || setupInput.useEnv) {
       throw new Error(SETUP_CODE_CONFLICT_ERROR);
     }
-    let setup = parseClickClackSetupCodeInput({
+    const setup = parseClickClackSetupCodeInput({
       code: setupInput.code,
       baseUrl: setupInput.baseUrl,
     });
@@ -302,11 +238,10 @@ export const clickClackSetupAdapter: ChannelSetupAdapter = {
     } catch (error) {
       throw formatClickClackSetupCodeClaimError(error);
     }
-    setup = { ...setup, baseUrl: claim.api_base_url ?? setup.baseUrl };
     const { code: _code, tokenFile: _tokenFile, useEnv: _useEnv, ...remainingInput } = setupInput;
     return {
       ...remainingInput,
-      baseUrl: setup.baseUrl,
+      baseUrl: claim.api_base_url ?? setup.baseUrl,
       token: claim.token,
       workspace: claim.workspace.id,
       ...(claim.defaults.defaultTo !== undefined ? { defaultTo: claim.defaults.defaultTo } : {}),
@@ -325,15 +260,14 @@ export const clickClackSetupAdapter: ChannelSetupAdapter = {
       accountId,
       name,
     }),
-  validateInput: createSetupInputPresenceValidator({
+  validateInput: createSetupInputPresenceValidator<ClickClackSetupInput>({
     defaultAccountOnlyEnvError: "CLICKCLACK_BOT_TOKEN can only be used for the default account.",
     whenNotUseEnv: [
       { someOf: ["token", "tokenFile"], message: REQUIRED_INPUT_ERROR },
       { someOf: ["baseUrl"], message: REQUIRED_INPUT_ERROR },
       { someOf: ["workspace"], message: REQUIRED_INPUT_ERROR },
     ],
-    validate: ({ cfg, accountId, input }) => {
-      const setupInput = input as ClickClackSetupInput;
+    validate: ({ cfg, accountId, input: setupInput }) => {
       const baseUrl = normalizeClickClackBaseUrl(setupInput.baseUrl);
       if (setupInput.baseUrl && !baseUrl) {
         return INVALID_BASE_URL_ERROR;
@@ -355,8 +289,7 @@ export const clickClackSetupAdapter: ChannelSetupAdapter = {
       return null;
     },
   }),
-  applyAccountConfig: ({ cfg, accountId, input }) => {
-    const setupInput = input as ClickClackSetupInput;
+  applyAccountConfig: ({ cfg, accountId, input: setupInput }) => {
     const existing = setupInput.useEnv
       ? resolveClickClackAccountConfig(cfg as CoreConfig, accountId)
       : undefined;
@@ -439,6 +372,7 @@ export const clickClackSetupContract = defineChannelSetupContract({
     useEnv: {
       kind: "boolean",
       cli: { flags: "--use-env", description: "Use CLICKCLACK_BOT_TOKEN" },
+      envVars: ["CLICKCLACK_BOT_TOKEN"],
     },
   },
   legacyAdapter: clickClackSetupAdapter,

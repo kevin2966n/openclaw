@@ -8,6 +8,10 @@ import {
   ATTR_GEN_AI_TOOL_DEFINITIONS,
   GEN_AI_OPERATION_NAME_VALUE_EXECUTE_TOOL,
 } from "@opentelemetry/semantic-conventions/incubating";
+import type {
+  DiagnosticEventPrivateData,
+  DiagnosticModelCallContent,
+} from "openclaw/plugin-sdk/diagnostic-runtime";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   MAX_OTEL_CONTENT_ARRAY_ITEMS,
@@ -16,18 +20,6 @@ import {
   safeJsonString,
   type OtelContentCapturePolicy,
 } from "./service-content-normalization.js";
-
-export type OtelModelCallContent = {
-  inputMessages?: unknown;
-  outputMessages?: unknown;
-  systemPrompt?: string;
-  toolDefinitions?: unknown;
-};
-
-export type OtelToolCallContent = {
-  toolInput?: unknown;
-  toolOutput?: unknown;
-};
 
 function textPart(content: string): Record<string, unknown> {
   return { type: "text", content };
@@ -111,16 +103,10 @@ function contentParts(value: unknown): Record<string, unknown>[] {
     const text = textPartContent(part);
     if (text !== undefined) {
       parts.push(textPart(text));
-    } else if (part.type === "thinking" && typeof part.thinking === "string") {
-      parts.push({ type: "reasoning", content: part.thinking });
-    } else if (part.type === "toolCall" && typeof part.name === "string") {
-      parts.push({
-        type: "tool_call",
-        name: part.name,
-        ...(typeof part.id === "string" ? { id: part.id } : {}),
-        ...(part.arguments !== undefined ? { arguments: part.arguments } : {}),
-      });
-    } else if (part.type === "tool_call" && typeof part.name === "string") {
+    } else if (
+      (part.type === "toolCall" || part.type === "tool_call") &&
+      typeof part.name === "string"
+    ) {
       parts.push({
         type: "tool_call",
         name: part.name,
@@ -141,6 +127,71 @@ function contentParts(value: unknown): Record<string, unknown>[] {
     }
   }
   return parts;
+}
+
+const INTERNAL_REASONING_MESSAGE_FIELDS = [
+  "reasoning",
+  "reasoning_content",
+  "reasoning_details",
+  "reasoning_text",
+] as const;
+
+const INTERNAL_REASONING_PART_FIELDS = [
+  "textSignature",
+  "thinkingSignature",
+  "thoughtSignature",
+] as const;
+
+function redactInternalReasoningParts(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+  return value.map((part) => {
+    if (
+      isRecord(part) &&
+      (part.type === "thinking" || part.type === "redacted_thinking" || part.type === "reasoning")
+    ) {
+      return { type: "reasoning", redacted: true };
+    }
+    if (!isRecord(part)) {
+      return part;
+    }
+    const redacted = { ...part };
+    // Replay signatures carry opaque provider reasoning state even when attached
+    // to visible text or tool calls. Preserve the visible part, not replay state.
+    for (const field of INTERNAL_REASONING_PART_FIELDS) {
+      delete redacted[field];
+    }
+    return redacted;
+  });
+}
+
+function redactInternalReasoningFromMessage(value: unknown): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+  const redacted = { ...value };
+  // Compatible provider replay payloads can attach reasoning beside `content`
+  // instead of using OpenClaw's normalized thinking blocks. Those fields are
+  // transport-private too and must not survive compatibility serialization.
+  for (const field of INTERNAL_REASONING_MESSAGE_FIELDS) {
+    delete redacted[field];
+  }
+  const hasContentParts = Array.isArray(value.content);
+  const hasExplicitParts = Array.isArray(value.parts);
+  if (hasContentParts) {
+    redacted.content = redactInternalReasoningParts(value.content);
+  }
+  if (hasExplicitParts) {
+    redacted.parts = redactInternalReasoningParts(value.parts);
+  }
+  return redacted;
+}
+
+function redactInternalReasoningFromMessages(value: unknown): unknown {
+  return Array.isArray(value)
+    ? value.map((message) => redactInternalReasoningFromMessage(message))
+    : redactInternalReasoningFromMessage(value);
 }
 
 function normalizeGenAiMessage(
@@ -233,7 +284,7 @@ function assignJsonAttribute(
 
 function assignGenAiModelContentAttributes(
   attributes: Record<string, string | number | boolean>,
-  content: OtelModelCallContent | undefined,
+  content: DiagnosticModelCallContent | undefined,
   policy: OtelContentCapturePolicy,
 ): void {
   if (policy.systemPrompt && typeof content?.systemPrompt === "string") {
@@ -291,15 +342,25 @@ export function assignOtelToolIdentityAttributes(
 
 export function assignOtelModelContentAttributes(
   attributes: Record<string, string | number | boolean>,
-  content: OtelModelCallContent | undefined,
+  content: DiagnosticModelCallContent | undefined,
   policy: OtelContentCapturePolicy,
 ): void {
-  assignGenAiModelContentAttributes(attributes, content, policy);
+  // Provider-native thinking blocks are not user-visible model output. Keep only
+  // a structural marker on compatibility attributes and omit them from semconv
+  // message parts, whose reasoning schema requires exportable content.
+  const redactedContent = content
+    ? {
+        ...content,
+        inputMessages: redactInternalReasoningFromMessages(content.inputMessages),
+        outputMessages: redactInternalReasoningFromMessages(content.outputMessages),
+      }
+    : undefined;
+  assignGenAiModelContentAttributes(attributes, redactedContent, policy);
   if (policy.inputMessages) {
     assignOtelContentAttribute(
       attributes,
       "openclaw.content.input_messages",
-      content?.inputMessages,
+      redactedContent?.inputMessages,
     );
   }
   if (policy.toolDefinitions) {
@@ -313,7 +374,7 @@ export function assignOtelModelContentAttributes(
     assignOtelContentAttribute(
       attributes,
       "openclaw.content.output_messages",
-      content?.outputMessages,
+      redactedContent?.outputMessages,
     );
   }
   if (policy.systemPrompt) {
@@ -323,7 +384,7 @@ export function assignOtelModelContentAttributes(
 
 export function assignOtelToolContentAttributes(
   attributes: Record<string, string | number | boolean>,
-  content: OtelToolCallContent | undefined,
+  content: DiagnosticEventPrivateData["toolContent"],
   policy: OtelContentCapturePolicy,
 ): void {
   // Mirror captured content onto the semconv keys next to the shipped

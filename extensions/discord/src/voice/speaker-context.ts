@@ -1,4 +1,3 @@
-// Discord plugin module implements speaker context behavior.
 import {
   asDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
@@ -24,7 +23,8 @@ type VoiceSpeakerContext = Omit<VoiceSpeakerIdentity, "memberRoleIds"> & {
 export class DiscordVoiceSpeakerContextResolver {
   private readonly cache = new Map<
     string,
-    VoiceSpeakerContext & {
+    {
+      context: VoiceSpeakerContext;
       expiresAt: number;
     }
   >();
@@ -33,7 +33,6 @@ export class DiscordVoiceSpeakerContextResolver {
     private readonly params: {
       client: Client;
       ownerAllowFrom?: string[];
-      ownerAllowAll?: boolean;
     },
   ) {}
 
@@ -48,7 +47,11 @@ export class DiscordVoiceSpeakerContextResolver {
       label: identity.label,
       name: identity.name,
       tag: identity.tag,
-      senderIsOwner: this.resolveIsOwner(identity),
+      senderIsOwner: resolveDiscordOwnerAccess({
+        allowFrom: this.params.ownerAllowFrom,
+        sender: identity,
+        allowNameMatching: false,
+      }).ownerAllowed,
     };
     this.setCachedContext(guildId, userId, context);
     return context;
@@ -88,21 +91,6 @@ export class DiscordVoiceSpeakerContextResolver {
     }
   }
 
-  private resolveIsOwner(identity: Pick<VoiceSpeakerIdentity, "id" | "name" | "tag">): boolean {
-    if (this.params.ownerAllowAll === true) {
-      return true;
-    }
-    return resolveDiscordOwnerAccess({
-      allowFrom: this.params.ownerAllowFrom,
-      sender: {
-        id: identity.id,
-        name: identity.name,
-        tag: identity.tag,
-      },
-      allowNameMatching: false,
-    }).ownerAllowed;
-  }
-
   private resolveCacheKey(guildId: string, userId: string): string {
     return `${guildId}:${userId}`;
   }
@@ -119,13 +107,7 @@ export class DiscordVoiceSpeakerContextResolver {
       this.cache.delete(key);
       return undefined;
     }
-    return {
-      id: cached.id,
-      label: cached.label,
-      name: cached.name,
-      tag: cached.tag,
-      senderIsOwner: cached.senderIsOwner,
-    };
+    return { ...cached.context };
   }
 
   private setCachedContext(guildId: string, userId: string, context: VoiceSpeakerContext): void {
@@ -133,7 +115,7 @@ export class DiscordVoiceSpeakerContextResolver {
     const expiresAt = resolveExpiresAtMsFromDurationMs(SPEAKER_CONTEXT_CACHE_TTL_MS);
     if (expiresAt !== undefined) {
       this.cache.set(key, {
-        ...context,
+        context: { ...context },
         expiresAt,
       });
     }

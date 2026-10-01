@@ -1,20 +1,18 @@
-/**
- * Runs the fail-closed before_agent_run gate and persists blocked turns.
- */
 import { resolveBlockMessage } from "../../../plugins/hook-decision-types.js";
 import type { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
+import { sanitizeCompactionReplayMessages } from "../../compaction-replay.js";
 import type { AgentMessage } from "../../runtime/index.js";
+import type { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
+import { withSessionManagerWrite } from "../../sessions/session-manager-write-admission.js";
 import { log } from "../logger.js";
-import { cloneHookMessages } from "./attempt-hook-messages.js";
-import { flushSessionManagerTranscript } from "./attempt-transcript-helpers.js";
 import { sessionMessagesContainIdempotencyKey } from "./pre-persisted-user-turn.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
 type HookRunner = NonNullable<ReturnType<typeof getGlobalHookRunner>>;
 type BeforeAgentRunHookRunner = Pick<HookRunner, "hasHooks" | "runBeforeAgentRun">;
 type HookContext = Parameters<HookRunner["runBeforeAgentRun"]>[1];
-type AttemptSessionManager = Parameters<typeof flushSessionManagerTranscript>[0];
-type WithOwnedSessionWriteLock = <T>(operation: () => Promise<T> | T) => Promise<T>;
+type AttemptSessionManager = ReturnType<typeof guardSessionManager>;
+type WithOwnedTranscriptWrite = <T>(operation: () => Promise<T> | T) => Promise<T>;
 
 type BeforeAgentRunSession = {
   messages: AgentMessage[];
@@ -38,7 +36,7 @@ export async function runEmbeddedAttemptBeforeAgentRun(input: {
   modelPrompt: string;
   sessionManager: AttemptSessionManager;
   systemPrompt: string;
-  withOwnedSessionWriteLock: WithOwnedSessionWriteLock;
+  withOwnedTranscriptWrite: WithOwnedTranscriptWrite;
 }): Promise<BeforeAgentRunBlockOutcome | undefined> {
   if (!input.hookRunner?.hasHooks("before_agent_run")) {
     return undefined;
@@ -47,10 +45,10 @@ export async function runEmbeddedAttemptBeforeAgentRun(input: {
   const persistBlockedBeforeAgentRun = async (block: {
     message: string;
     pluginId: string;
-  }): Promise<boolean> => {
+  }): Promise<void> => {
     const idempotencyKey = `hook-block:before_agent_run:user:${input.attempt.runId}`;
     if (sessionMessagesContainIdempotencyKey(input.activeSession.messages, idempotencyKey)) {
-      return true;
+      return;
     }
     const nowMs = Date.now();
     const redactedUserMessage = {
@@ -66,22 +64,23 @@ export async function runEmbeddedAttemptBeforeAgentRun(input: {
       },
     };
     try {
-      await input.withOwnedSessionWriteLock(() => {
-        input.sessionManager.appendMessage(
-          redactedUserMessage as Parameters<typeof input.sessionManager.appendMessage>[0],
-        );
-        flushSessionManagerTranscript(input.sessionManager);
-      });
-      input.activeSession.agent.state.messages =
-        input.sessionManager.buildSessionContext().messages;
-      return true;
+      await input.withOwnedTranscriptWrite(() =>
+        withSessionManagerWrite(input.sessionManager, () => {
+          input.sessionManager.appendMessage(
+            redactedUserMessage as Parameters<typeof input.sessionManager.appendMessage>[0],
+          );
+          input.sessionManager.flushPendingPersistence();
+        }),
+      );
+      input.activeSession.agent.state.messages = sanitizeCompactionReplayMessages(
+        input.sessionManager.buildSessionContext().messages,
+      );
     } catch (err) {
       log.warn(
         `before_agent_run block: failed to persist redacted user message: ${
           (err as Error)?.message ?? String(err)
         }`,
       );
-      return false;
     }
   };
 
@@ -91,7 +90,8 @@ export async function runEmbeddedAttemptBeforeAgentRun(input: {
       {
         prompt: input.modelPrompt,
         systemPrompt: input.systemPrompt,
-        messages: cloneHookMessages(input.hookMessages),
+        /** Gives hooks an isolated message snapshot they cannot mutate in-session. */
+        messages: input.hookMessages.map((message) => structuredClone(message)),
         channelId: input.hookContext.channelId,
         accountId: input.attempt.agentAccountId ?? undefined,
         senderId: input.attempt.senderId ?? undefined,

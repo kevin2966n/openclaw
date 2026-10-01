@@ -1,23 +1,11 @@
 import type { DatabaseSync } from "node:sqlite";
+import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
+import { asOptionalRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeNullableString } from "@openclaw/normalization-core/string-coerce";
+import { tableExists } from "./openclaw-state-db-schema-helpers.js";
 
 function readMigratedEntry(value: unknown): Record<string, unknown> | undefined {
-  if (typeof value === "string") {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>)
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function normalizedText(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
+  return typeof value === "string" ? safeParseJsonRecord(value) : asOptionalRecord(value);
 }
 
 export function addSessionProvenanceColumns(
@@ -48,12 +36,8 @@ export function backfillSessionEntryProvenance(db: DatabaseSync, previousVersion
   if (previousVersion >= 8) {
     return;
   }
-  const hasSessionEntries = db
-    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_entries'")
-    .get();
-  const hasSessions = db
-    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'")
-    .get();
+  const hasSessionEntries = tableExists(db, "session_entries");
+  const hasSessions = tableExists(db, "sessions");
   if (!hasSessionEntries || !hasSessions) {
     return;
   }
@@ -64,24 +48,24 @@ export function backfillSessionEntryProvenance(db: DatabaseSync, previousVersion
        INNER JOIN sessions AS s
          ON s.session_id = se.session_id AND s.session_key = se.session_key;`,
     )
-    .all() as Array<{ entry_json?: unknown; session_id?: unknown }>;
+    .all();
   const update = db.prepare(`
     UPDATE sessions
     SET session_entry_provenance = 1, acp_owned = ?, plugin_owner_id = ?,
         hook_external_content_source = ?
     WHERE session_id = ?;
   `);
+  update.setReadBigInts(true);
   for (const row of rows) {
-    const sessionId = normalizedText(row.session_id);
+    const sessionId = normalizeNullableString(row.session_id);
     const entry = readMigratedEntry(row.entry_json);
     if (!sessionId || !entry) {
       continue;
     }
-    const hookSource = normalizedText(entry.hookExternalContentSource);
-    const acp = entry.acp;
+    const hookSource = normalizeNullableString(entry.hookExternalContentSource);
     update.run(
-      acp && typeof acp === "object" && !Array.isArray(acp) ? 1 : 0,
-      normalizedText(entry.pluginOwnerId),
+      isRecord(entry.acp) ? 1 : 0,
+      normalizeNullableString(entry.pluginOwnerId),
       hookSource === "gmail" || hookSource === "webhook" ? hookSource : null,
       sessionId,
     );
@@ -89,10 +73,7 @@ export function backfillSessionEntryProvenance(db: DatabaseSync, previousVersion
 }
 
 export function backfillTranscriptMutationWatermarks(db: DatabaseSync): void {
-  const transcriptTable = db
-    .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?")
-    .get("transcript_events") as { ok?: unknown } | undefined;
-  if (transcriptTable?.ok !== 1) {
+  if (!tableExists(db, "transcript_events")) {
     return;
   }
   db.exec(`

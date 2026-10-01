@@ -1,5 +1,5 @@
-// Policy plugin exec approval evidence.
 import {
+  asNonArrayRecord,
   isRecord,
   asBoolean as readBoolean,
   normalizeOptionalString as readString,
@@ -21,7 +21,7 @@ export function scanPolicyExecApprovals(raw: string): readonly PolicyExecApprova
     return [];
   }
   const evidence: PolicyExecApprovalEvidence[] = [];
-  const defaults = isRecord(parsed.defaults) ? parsed.defaults : {};
+  const defaults = asNonArrayRecord(parsed.defaults);
   evidence.push(
     execApprovalPostureEvidence(
       "defaults",
@@ -151,20 +151,11 @@ function execApprovalAgentFromParts(
   sourceAgentId: string,
   value: Record<string, unknown>,
 ): NormalizedExecApprovalAgent {
-  const allowlistEntries = execApprovalAllowlistEntries(value.allowlist).map(
-    (entry): NormalizedExecApprovalAllowlistEntry => ({
-      index: entry.index,
-      pattern: entry.pattern,
-      argPattern: entry.argPattern,
-      entrySource: entry.entrySource,
-      sourceAgentId,
-    }),
-  );
   return {
     agentId,
     sourceAgentId,
     value,
-    allowlistEntries,
+    allowlistEntries: withExecApprovalAllowlistSource(value.allowlist, sourceAgentId),
   };
 }
 
@@ -179,25 +170,7 @@ function mergeLegacyExecApprovalAgent(
     ask: current.ask ?? legacy.ask,
     askFallback: current.askFallback ?? legacy.askFallback,
     autoAllowSkills: current.autoAllowSkills ?? legacy.autoAllowSkills,
-    allowlist: mergedExecApprovalAllowlist(current.allowlist, legacy.allowlist),
   };
-}
-
-function mergedExecApprovalAllowlist(
-  current: unknown,
-  legacy: unknown,
-): readonly unknown[] | undefined {
-  const entries = mergedExecApprovalAllowlistEntries(current, legacy).map((entry) => {
-    const allowlistEntry: Record<string, unknown> = { pattern: entry.pattern };
-    if (entry.argPattern !== undefined) {
-      allowlistEntry.argPattern = entry.argPattern;
-    }
-    if (entry.entrySource !== undefined) {
-      allowlistEntry.source = entry.entrySource;
-    }
-    return allowlistEntry;
-  });
-  return entries.length === 0 ? undefined : entries;
 }
 
 function mergedExecApprovalAllowlistEntries(
@@ -225,19 +198,13 @@ function withExecApprovalAllowlistSource(
   value: unknown,
   sourceAgentId: string,
 ): readonly NormalizedExecApprovalAllowlistEntry[] {
-  return execApprovalAllowlistEntries(value).map(
-    (entry): NormalizedExecApprovalAllowlistEntry => ({
-      index: entry.index,
-      pattern: entry.pattern,
-      argPattern: entry.argPattern,
-      entrySource: entry.entrySource,
-      sourceAgentId,
-    }),
-  );
-}
-
-function readExecApprovalAllowlistEntrySource(value: unknown): "allow-always" | undefined {
-  return readString(value) === "allow-always" ? "allow-always" : undefined;
+  return execApprovalAllowlistEntries(value).map((entry): NormalizedExecApprovalAllowlistEntry => ({
+    index: entry.index,
+    pattern: entry.pattern,
+    argPattern: entry.argPattern,
+    entrySource: entry.entrySource,
+    sourceAgentId,
+  }));
 }
 
 function execApprovalAllowlistEntries(value: unknown): readonly {
@@ -271,7 +238,7 @@ function execApprovalAllowlistEntries(value: unknown): readonly {
       continue;
     }
     const argPattern = readString(entry.argPattern);
-    const entrySource = readExecApprovalAllowlistEntrySource(entry.source);
+    const entrySource = readString(entry.source) === "allow-always" ? "allow-always" : undefined;
     entries.push({
       index,
       pattern,

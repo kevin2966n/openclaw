@@ -2,11 +2,11 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { isRecord } from "../../../../packages/normalization-core/src/record-coerce.js";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalString,
   normalizeOptionalStringifiedId,
-} from "../../../../packages/normalization-core/src/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
 import { coerceFiniteScheduleNumber } from "../../../cron/schedule-number.js";
 import { normalizeCronStaggerMs } from "../../../cron/stagger.js";
 import type {
@@ -16,6 +16,7 @@ import type {
 } from "../../../cron/store.js";
 import type { CronStoreFile } from "../../../cron/types.js";
 import { syncDirectoryIfSupported } from "../../../infra/directory-durability.js";
+import { formatErrorMessage } from "../../../infra/errors.js";
 import { parseJsonWithJson5Fallback } from "../../../utils/parse-json-compat.js";
 
 const LEGACY_CRON_ARCHIVE_SUFFIX = ".migrated";
@@ -90,10 +91,6 @@ async function legacyCronFileExists(filePath: string): Promise<boolean> {
 
 type ArchiveOutcome = { ok: true; archivePath?: string } | { ok: false; reason: string };
 
-function formatArchiveError(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 async function sha256File(filePath: string): Promise<string> {
   return createHash("sha256")
     .update(await fs.readFile(filePath))
@@ -131,7 +128,7 @@ async function restoreArchivedSource(
   } catch (err) {
     return {
       ok: false,
-      reason: `archive remains at ${archivePath} because the source path could not be checked: ${formatArchiveError(err)}`,
+      reason: `archive remains at ${archivePath} because the source path could not be checked: ${formatErrorMessage(err)}`,
     };
   }
   try {
@@ -148,7 +145,7 @@ async function restoreArchivedSource(
     }
     return {
       ok: false,
-      reason: `archive remains at ${archivePath} because restoration failed: ${formatArchiveError(err)}`,
+      reason: `archive remains at ${archivePath} because restoration failed: ${formatErrorMessage(err)}`,
     };
   }
   try {
@@ -157,7 +154,7 @@ async function restoreArchivedSource(
   } catch (err) {
     return {
       ok: false,
-      reason: `the source was restored, but rollback directory sync failed: ${formatArchiveError(err)}`,
+      reason: `the source was restored, but rollback directory sync failed: ${formatErrorMessage(err)}`,
     };
   }
 }
@@ -228,10 +225,10 @@ async function copyLegacyCronFileAcrossDevices(
     if (sourceRemoved) {
       return {
         ok: false,
-        reason: `${formatArchiveError(err)}; the durable archive is preserved at ${archivePath} because the source was already removed`,
+        reason: `${formatErrorMessage(err)}; the durable archive is preserved at ${archivePath} because the source was already removed`,
       };
     }
-    const cleanupFailures: string[] = [];
+    let cleanupReason = "";
     if (archiveCreated) {
       let archiveRemoved = false;
       try {
@@ -245,19 +242,17 @@ async function copyLegacyCronFileAcrossDevices(
         archiveRemoved = true;
         await syncDirectoryIfSupported(path.dirname(archivePath));
       } catch (cleanupErr) {
-        cleanupFailures.push(
-          archiveRemoved
-            ? `the partial archive was removed, but cleanup directory sync failed: ${formatArchiveError(cleanupErr)}`
-            : `partial archive remains at ${archivePath} because cleanup failed: ${formatArchiveError(cleanupErr)}`,
-        );
+        cleanupReason = archiveRemoved
+          ? `; the partial archive was removed, but cleanup directory sync failed: ${formatErrorMessage(cleanupErr)}`
+          : `; partial archive remains at ${archivePath} because cleanup failed: ${formatErrorMessage(cleanupErr)}`;
       }
     }
-    const cleanupReason = cleanupFailures.length > 0 ? `; ${cleanupFailures.join("; ")}` : "";
-    return { ok: false, reason: `${formatArchiveError(err)}${cleanupReason}` };
+    return { ok: false, reason: `${formatErrorMessage(err)}${cleanupReason}` };
   }
 }
 
-async function archiveLegacyCronFile(
+/** Archives an imported legacy cron artifact only after its source bytes are verified. */
+export async function archiveLegacyCronFile(
   filePath: string,
   expectedSha256?: string,
 ): Promise<ArchiveOutcome> {
@@ -270,7 +265,7 @@ async function archiveLegacyCronFile(
       archivePath = `${filePath}${LEGACY_CRON_ARCHIVE_SUFFIX}.${index}`;
     }
   } catch (err) {
-    return { ok: false, reason: formatArchiveError(err) };
+    return { ok: false, reason: formatErrorMessage(err) };
   }
 
   try {
@@ -279,7 +274,7 @@ async function archiveLegacyCronFile(
     // A cross-device rename can occur when the configured store is a mounted file.
     // Fsync before source removal and roll back failed cleanup so retries stay idempotent.
     if ((err as { code?: unknown })?.code !== "EXDEV") {
-      return { ok: false, reason: formatArchiveError(err) };
+      return { ok: false, reason: formatErrorMessage(err) };
     }
     return await copyLegacyCronFileAcrossDevices(filePath, archivePath, expectedSha256);
   }
@@ -301,8 +296,8 @@ async function archiveLegacyCronFile(
     return {
       ok: false,
       reason: restoreFailure.ok
-        ? formatArchiveError(err)
-        : `${formatArchiveError(err)}; ${restoreFailure.reason}`,
+        ? formatErrorMessage(err)
+        : `${formatErrorMessage(err)}; ${restoreFailure.reason}`,
     };
   }
 }
@@ -313,33 +308,16 @@ function parseCronStateFile(raw: string): {
 } | null {
   try {
     const parsed = parseJsonWithJson5Fallback(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return null;
-    }
-    const record = parsed as Record<string, unknown>;
-    if (
-      record.version !== 1 ||
-      typeof record.jobs !== "object" ||
-      record.jobs === null ||
-      Array.isArray(record.jobs)
-    ) {
+    if (!isRecord(parsed) || parsed.version !== 1 || !isRecord(parsed.jobs)) {
       return null;
     }
     return {
       version: 1,
-      jobs: record.jobs as Record<string, CronConfigJobRuntimeEntry>,
+      jobs: parsed.jobs as Record<string, CronConfigJobRuntimeEntry>,
     };
   } catch {
     return null;
   }
-}
-
-function readString(record: Record<string, unknown>, key: string): string | undefined {
-  return normalizeOptionalString(record[key]);
-}
-
-function readNumber(record: Record<string, unknown>, key: string): number | undefined {
-  return coerceFiniteScheduleNumber(record[key]);
 }
 
 function legacySchedulePayloadFromRecord(
@@ -349,13 +327,13 @@ function legacySchedulePayloadFromRecord(
   | { kind: "every"; everyMs: number; anchorMs?: number }
   | { kind: "cron"; expr: string; tz?: string; staggerMs?: number }
   | undefined {
-  const rawKind = readString(schedule, "kind")?.toLowerCase();
-  const expr = readString(schedule, "expr") ?? readString(schedule, "cron");
-  const at = readString(schedule, "at");
-  const atMs = readNumber(schedule, "atMs");
-  const everyMs = readNumber(schedule, "everyMs");
-  const anchorMs = readNumber(schedule, "anchorMs");
-  const tz = readString(schedule, "tz");
+  const rawKind = normalizeOptionalString(schedule.kind)?.toLowerCase();
+  const expr = normalizeOptionalString(schedule.expr) ?? normalizeOptionalString(schedule.cron);
+  const at = normalizeOptionalString(schedule.at);
+  const atMs = coerceFiniteScheduleNumber(schedule.atMs);
+  const everyMs = coerceFiniteScheduleNumber(schedule.everyMs);
+  const anchorMs = coerceFiniteScheduleNumber(schedule.anchorMs);
+  const tz = normalizeOptionalString(schedule.tz);
   const staggerMs = normalizeCronStaggerMs(schedule.staggerMs);
   const kind =
     rawKind === "at" || rawKind === "every" || rawKind === "cron"
@@ -385,10 +363,7 @@ function legacySchedulePayloadFromRecord(
 }
 
 function tryLegacyCronScheduleIdentity(job: Record<string, unknown>): string | undefined {
-  const schedule =
-    job.schedule && typeof job.schedule === "object" && !Array.isArray(job.schedule)
-      ? legacySchedulePayloadFromRecord(job.schedule as Record<string, unknown>)
-      : legacySchedulePayloadFromRecord(job);
+  const schedule = legacySchedulePayloadFromRecord(isRecord(job.schedule) ? job.schedule : job);
   if (!schedule) {
     return undefined;
   }
@@ -405,10 +380,6 @@ function getRawCronJobs(parsed: unknown): unknown[] {
     : isRecord(parsed) && Array.isArray(parsed.jobs)
       ? parsed.jobs
       : [];
-}
-
-function cloneConfigJobs(jobs: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
-  return jobs.map((job) => structuredClone(job));
 }
 
 async function loadStateFile(statePath: string): Promise<{
@@ -436,20 +407,20 @@ function hasInlineState(jobs: Array<Record<string, unknown> | null | undefined>)
   );
 }
 
-function ensureJobStateObject(job: CronStoreFile["jobs"][number]): void {
+function ensureJobStateObject(job: Record<string, unknown>): void {
   if (!isRecord(job.state)) {
-    job.state = {} as never;
+    job.state = {};
   }
 }
 
-function backfillMissingRuntimeFields(job: CronStoreFile["jobs"][number]): void {
+function backfillMissingRuntimeFields(job: Record<string, unknown>): void {
   ensureJobStateObject(job);
   if (typeof job.updatedAtMs !== "number") {
     job.updatedAtMs = typeof job.createdAtMs === "number" ? job.createdAtMs : Date.now();
   }
 }
 
-function resolveUpdatedAtMs(job: CronStoreFile["jobs"][number], updatedAtMs: unknown): number {
+function resolveUpdatedAtMs(job: Record<string, unknown>, updatedAtMs: unknown): number {
   if (typeof updatedAtMs === "number" && Number.isFinite(updatedAtMs)) {
     return updatedAtMs;
   }
@@ -461,20 +432,19 @@ function resolveUpdatedAtMs(job: CronStoreFile["jobs"][number], updatedAtMs: unk
     : Date.now();
 }
 
-function mergeStateFileEntry(job: CronStoreFile["jobs"][number], entry: unknown): void {
+function mergeStateFileEntry(job: Record<string, unknown>, entry: unknown): void {
   if (!isRecord(entry)) {
     backfillMissingRuntimeFields(job);
     return;
   }
   job.updatedAtMs = resolveUpdatedAtMs(job, entry.updatedAtMs);
-  job.state = isRecord(entry.state) ? (entry.state as never) : ({} as never);
+  const state = isRecord(entry.state) ? entry.state : {};
+  job.state = state;
   if (
     typeof entry.scheduleIdentity === "string" &&
-    entry.scheduleIdentity !==
-      tryLegacyCronScheduleIdentity(job as unknown as Record<string, unknown>)
+    entry.scheduleIdentity !== tryLegacyCronScheduleIdentity(job)
   ) {
-    ensureJobStateObject(job);
-    job.state.nextRunAtMs = undefined;
+    state.nextRunAtMs = undefined;
   }
 }
 
@@ -482,7 +452,6 @@ function resolveCronStateId(job: Record<string, unknown>): string | undefined {
   return normalizeOptionalString(job.id) ?? normalizeOptionalString(job.jobId);
 }
 
-/** Return true when legacy cron JSON or state files exist for a store path. */
 export async function legacyCronStoreFilesExist(storePath: string): Promise<boolean> {
   const resolvedStorePath = path.resolve(storePath);
   return (
@@ -518,7 +487,7 @@ export async function archiveLegacyCronStoreForMigration(
         ? "legacy cron state appeared after the store was imported; refusing to archive it"
         : undefined;
     } catch (err) {
-      return `legacy cron state path could not be checked: ${formatArchiveError(err)}`;
+      return `legacy cron state path could not be checked: ${formatErrorMessage(err)}`;
     }
   };
 
@@ -558,7 +527,6 @@ export async function archiveLegacyCronStoreForMigration(
   return failures.length === 0 ? { ok: true } : { ok: false, failures };
 }
 
-/** Load legacy cron JSON/state files into the current loaded-store shape for migration. */
 export async function loadLegacyCronStoreForMigration(
   storePath: string,
 ): Promise<LoadedCronStore & { migrationSource?: LegacyCronMigrationSource }> {
@@ -583,6 +551,10 @@ export async function loadLegacyCronStoreForMigration(
         // The source position distinguishes identical id-less rows, while the raw digest
         // prevents an edited retry from being mistaken for the row previously imported.
         markLegacyCronMigrationIdentity(row, index);
+        // File-era jobs discarded origin before persistence, just like pre-v14 SQLite jobs.
+        if (isRecord(row.createdActor) && row.createdActor.type === "human") {
+          row.createdActor = { ...row.createdActor, source: "unknown" };
+        }
         configJobIndexes.push(index);
         configRows.push(row);
       } else {
@@ -597,8 +569,8 @@ export async function loadLegacyCronStoreForMigration(
       version: 1,
       jobs: configRows as never as CronStoreFile["jobs"],
     };
-    const jobs = store.jobs as unknown as Array<Record<string, unknown>>;
-    const configJobs = cloneConfigJobs(configRows);
+    const jobs = configRows;
+    const configJobs = configRows.map((job) => structuredClone(job));
 
     const statePath = resolveLegacyCronStatePath(resolvedStorePath);
     const loadedStateFile = await loadStateFile(statePath);
@@ -606,24 +578,20 @@ export async function loadLegacyCronStoreForMigration(
     const hasLegacyInlineState = !stateFile && hasInlineState(jobs);
 
     if (stateFile) {
-      for (const job of store.jobs) {
-        const stateId = resolveCronStateId(job as unknown as Record<string, unknown>);
+      for (const job of jobs) {
+        const stateId = resolveCronStateId(job);
         const entry = stateId ? stateFile.jobs[stateId] : undefined;
         configJobRuntimeEntries.push(isRecord(entry) ? structuredClone(entry) : {});
-        if (entry) {
-          mergeStateFileEntry(job, entry);
+        mergeStateFileEntry(job, entry);
+      }
+    } else {
+      for (const job of jobs) {
+        if (hasLegacyInlineState) {
+          ensureJobStateObject(job);
         } else {
           backfillMissingRuntimeFields(job);
         }
       }
-    } else if (!hasLegacyInlineState) {
-      for (const job of store.jobs) {
-        backfillMissingRuntimeFields(job);
-      }
-    }
-
-    for (const job of store.jobs) {
-      ensureJobStateObject(job);
     }
 
     return {

@@ -1,3 +1,4 @@
+import { getGroupThreadDispatchContext } from "../../auto-reply/group-thread-context.js";
 import { copyReplyPayloadMetadata } from "../../auto-reply/reply-payload.js";
 import { finalizeInboundContext } from "../../auto-reply/reply/inbound-context.js";
 import {
@@ -17,6 +18,7 @@ import {
 import { hasOutboundReplyContent } from "../../plugin-sdk/reply-payload.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { formatErrorMessage } from "../errors.js";
+import { normalizeEmptyPayloadForDelivery } from "./deliver-payload.js";
 import {
   OutboundDeliveryError,
   type OutboundDeliveryFailureStage,
@@ -24,10 +26,11 @@ import {
   type OutboundPayloadDeliveryOutcome,
   type OutboundPayloadDeliverySuppressionReason,
 } from "./deliver-types.js";
-import type { QueuedReplyPayloadSendingHook } from "./delivery-queue.js";
-import type { NormalizedOutboundPayload } from "./payloads.js";
-
-export { createMessageSentEmitter } from "./message-sent-hook.js";
+import type { QueuedReplyPayloadSendingHook } from "./delivery-queue-storage.js";
+import {
+  summarizeOutboundPayloadForTransport,
+  type NormalizedOutboundPayload,
+} from "./payloads.js";
 
 export type ReplyPayloadSuppressedObserver = (
   payload: ReplyPayload,
@@ -43,15 +46,18 @@ export function buildInboundReplyPayloadSendingBeforeDeliver(
   const finalized = finalizeInboundContext(ctx);
   const hookCtx = deriveInboundMessageHookContext(finalized);
   return markReplyDispatchBeforeDeliverDeadlineOwned(async (payload, info) => {
-    const runId = runState.runId;
+    const group = getGroupThreadDispatchContext();
+    const deliveryContext = group?.ctx ?? finalized;
+    const deliveryHookContext = group ? deriveInboundMessageHookContext(group.ctx) : hookCtx;
+    const runId = group ? group.runState.runId : runState.runId;
     const hookedPayload = await runReplyPayloadSendingHook({
       payload,
       kind: info.kind,
-      channel: finalized.Surface ?? finalized.Provider,
-      sessionKey: finalized.SessionKey,
+      channel: deliveryContext.Surface ?? deliveryContext.Provider,
+      sessionKey: deliveryContext.SessionKey,
       runId,
       usageState: consumeReplyUsageState(runId),
-      context: { ...toPluginMessageContext(hookCtx), runId },
+      context: { ...toPluginMessageContext(deliveryHookContext), runId },
     });
     if (!hookedPayload) {
       await onSuppressed?.(payload, info, "cancelled_by_reply_payload_sending_hook");
@@ -81,9 +87,13 @@ export function buildLegacyInboundMessageSendingBeforeDeliver(
       if (!payload.text) {
         return payload;
       }
+      const group = getGroupThreadDispatchContext();
       const result = await hookRunner.runMessageSending(
         { content: payload.text, to: replyTarget },
-        toPluginMessageContext(hookCtx),
+        {
+          ...toPluginMessageContext(hookCtx),
+          ...(group ? { sessionKey: group.ctx.SessionKey, runId: group.runState.runId } : {}),
+        },
       );
       if (result?.cancel) {
         return null;
@@ -93,6 +103,34 @@ export function buildLegacyInboundMessageSendingBeforeDeliver(
         : copyReplyPayloadMetadata(payload, { ...payload, text: result.content });
     },
   );
+}
+
+/** Run media-aware message policy before a core owner can capture projected output. */
+export function buildProjectedInboundMessageSendingBeforeDeliver(
+  ctx: MsgContext | FinalizedMsgContext,
+): ReplyDispatchBeforeDeliver {
+  const finalized = finalizeInboundContext(ctx);
+  const hookCtx = deriveInboundMessageHookContext(finalized);
+  const replyTarget = resolveInboundReplyHookTarget(finalized, hookCtx);
+  return markReplyDispatchBeforeDeliverDeadlineOwned(async (payload) => {
+    const hookRunner = getGlobalHookRunner();
+    const hookResult = await applyMessageSendingHook({
+      hookRunner,
+      enabled: hookRunner?.hasHooks("message_sending") ?? false,
+      payload,
+      payloadSummary: summarizeOutboundPayloadForTransport(payload),
+      to: replyTarget,
+      channel: hookCtx.channelId,
+      accountId: hookCtx.accountId,
+      replyToId: payload.replyToId ?? finalized.ReplyToIdFull ?? finalized.ReplyToId,
+      threadId: finalized.MessageThreadId,
+      sessionKey: finalized.SessionKey,
+    });
+    if (hookResult.cancelled) {
+      return null;
+    }
+    return normalizeEmptyPayloadForDelivery(hookResult.payload);
+  });
 }
 
 export async function applyMessageSendingHook(params: {
@@ -112,17 +150,17 @@ export async function applyMessageSendingHook(params: {
   hookMetadata?: Record<string, unknown>;
   contentRewritten: boolean;
   payload: ReplyPayload;
-  payloadSummary: NormalizedOutboundPayload;
 }> {
+  const unchanged = () => ({
+    cancelled: false,
+    contentRewritten: false,
+    payload: params.payload,
+  });
   if (!params.enabled) {
-    return {
-      cancelled: false,
-      contentRewritten: false,
-      payload: params.payload,
-      payloadSummary: params.payloadSummary,
-    };
+    return unchanged();
   }
   try {
+    const group = getGroupThreadDispatchContext();
     const sendingResult = await params.hookRunner!.runMessageSending(
       {
         to: params.to,
@@ -140,69 +178,43 @@ export async function applyMessageSendingHook(params: {
         accountId: params.accountId ?? undefined,
         conversationId: params.to,
         ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+        ...(group ? { sessionKey: group.ctx.SessionKey, runId: group.runState.runId } : {}),
       },
     );
     if (sendingResult?.cancel) {
       return {
+        ...unchanged(),
         cancelled: true,
         ...(sendingResult.cancelReason ? { cancelReason: sendingResult.cancelReason } : {}),
         ...(sendingResult.metadata ? { hookMetadata: sendingResult.metadata } : {}),
-        contentRewritten: false,
-        payload: params.payload,
-        payloadSummary: params.payloadSummary,
       };
     }
     if (sendingResult?.content == null) {
-      return {
-        cancelled: false,
-        contentRewritten: false,
-        payload: params.payload,
-        payloadSummary: params.payloadSummary,
-      };
+      return unchanged();
     }
-    if (params.payloadSummary.hookContent && !params.payloadSummary.text) {
-      const spokenText = sendingResult.content;
-      return {
-        cancelled: false,
-        contentRewritten: true,
-        payload: {
-          ...params.payload,
-          spokenText,
-        },
-        payloadSummary: {
-          ...params.payloadSummary,
-          hookContent: spokenText,
-        },
-      };
-    }
-    const payload = {
+    const spokenOnly = params.payloadSummary.hookContent && !params.payloadSummary.text;
+    const payload = copyReplyPayloadMetadata(params.payload, {
       ...params.payload,
-      text: sendingResult.content,
-    };
+      [spokenOnly ? "spokenText" : "text"]: sendingResult.content,
+    });
     return {
       cancelled: false,
       contentRewritten: true,
       payload,
-      payloadSummary: {
-        ...params.payloadSummary,
-        text: sendingResult.content,
-      },
     };
   } catch {
     // Don't block delivery on hook failure.
-    return {
-      cancelled: false,
-      contentRewritten: false,
-      payload: params.payload,
-      payloadSummary: params.payloadSummary,
-    };
+    return unchanged();
   }
 }
 
-export async function applyReplyPayloadSendingHook(params: {
-  hook: QueuedReplyPayloadSendingHook | undefined;
-  payload: ReplyPayload;
-}): Promise<{
+export async function applyReplyPayloadSendingHook(
+  params: {
+    hook: QueuedReplyPayloadSendingHook | undefined;
+    payload: ReplyPayload;
+  },
+  hookRunner = getGlobalHookRunner(),
+): Promise<{
   cancelled: boolean;
   payload: ReplyPayload;
   changed: boolean;
@@ -210,14 +222,17 @@ export async function applyReplyPayloadSendingHook(params: {
   if (!params.hook) {
     return { cancelled: false, payload: params.payload, changed: false };
   }
-  const nextPayload = await runReplyPayloadSendingHook({
-    payload: params.payload,
-    kind: params.hook.kind,
-    ...(params.hook.channel ? { channel: params.hook.channel } : {}),
-    ...(params.hook.sessionKey ? { sessionKey: params.hook.sessionKey } : {}),
-    ...(params.hook.runId ? { runId: params.hook.runId } : {}),
-    context: params.hook.context,
-  });
+  const nextPayload = await runReplyPayloadSendingHook(
+    {
+      payload: params.payload,
+      kind: params.hook.kind,
+      ...(params.hook.channel ? { channel: params.hook.channel } : {}),
+      ...(params.hook.sessionKey ? { sessionKey: params.hook.sessionKey } : {}),
+      ...(params.hook.runId ? { runId: params.hook.runId } : {}),
+      context: params.hook.context,
+    },
+    hookRunner,
+  );
   if (!nextPayload) {
     return { cancelled: true, payload: params.payload, changed: false };
   }
@@ -260,5 +275,3 @@ export function suppressedPayloadOutcome(params: {
     ...(params.hookEffect ? { hookEffect: params.hookEffect } : {}),
   };
 }
-
-/** Adds directive-derived media to the queue copy before spool custody. */

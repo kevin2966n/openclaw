@@ -1,18 +1,66 @@
+import { setTimeout as sleep } from "node:timers/promises";
+import { buildLiveTransportRttResult } from "../shared/live-transport-rtt.js";
 import type { SlackQaScenarioEnvironment } from "./scenario-environment.js";
 import { runSlackApprovalScenario } from "./slack-live.approvals.js";
 import { runSlackCodexApprovalScenario } from "./slack-live.codex-approval-runner.js";
-import type { SlackQaMessageScenarioRun } from "./slack-live.contracts.js";
+import type {
+  SlackQaMessageScenarioRun,
+  SlackObservedMessage,
+  SlackQaScenarioImplementation,
+} from "./slack-live.contracts.js";
 import {
   observeSlackScenarioMessages,
   waitForSlackNoReply,
   waitForSlackScenarioReply,
 } from "./slack-live.message-observations.js";
-import {
-  collectSlackActionValues,
-  collectSlackBlockText,
-  sendSlackChannelMessage,
-} from "./slack-live.observations.js";
-import { getSlackQaScenarioDefinition } from "./slack-live.scenarios.js";
+import { recordSlackObservedMessage, sendSlackChannelMessage } from "./slack-live.observations.js";
+
+async function waitForSlackPreReplyCapture(params: {
+  capture: NonNullable<SlackQaMessageScenarioRun["captureBeforeReply"]>;
+  channelId: string;
+  readMessages: () => Promise<SlackObservedMessage[]>;
+  scenarioId: string;
+  timeoutMs: number;
+}) {
+  const deadline = Date.now() + params.timeoutMs;
+  while (true) {
+    const messages = (await params.readMessages()).filter(
+      (message) => message.channelId === params.channelId,
+    );
+    if (params.capture(messages)) {
+      return;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error(
+        `timed out after ${params.timeoutMs}ms waiting for ${params.scenarioId} write capture`,
+      );
+    }
+    await sleep(Math.min(25, remainingMs));
+  }
+}
+
+export {
+  slackQaAllowlistBlockScenario,
+  slackQaApprovalExecNativeScenario,
+  slackQaApprovalPluginNativeScenario,
+  slackQaCanaryScenario,
+  slackQaChannelDisabledWarningScenario,
+  slackQaChartPresentationNativeScenario,
+  slackQaCodexApprovalExecNativeScenario,
+  slackQaCodexApprovalPluginNativeScenario,
+  slackQaMentionGatingScenario,
+  slackQaMpimAppMentionDedupeScenario,
+  slackQaProgressCommentaryFalseScenario,
+  slackQaProgressCommentaryOmittedScenario,
+  slackQaProgressCommentaryTrueScenario,
+  slackQaProgressCommentaryVerboseDedupeScenario,
+  slackQaProgressCommentaryVerboseFullScenario,
+  slackQaReactionGlyphNativeScenario,
+  slackQaTableInvalidBlocksFallbackScenario,
+  slackQaTablePresentationNativeScenario,
+  slackQaTopLevelReplyShapeScenario,
+} from "./slack-live.scenario-implementations.js";
 
 async function runSlackMessageScenario(params: {
   environment: SlackQaScenarioEnvironment;
@@ -21,22 +69,29 @@ async function runSlackMessageScenario(params: {
   scenarioTitle: string;
   timeoutMs: number;
 }) {
-  const beforeRunResult = await params.run.beforeRun?.(params.environment.context);
-  const beforeRunDetails =
-    typeof beforeRunResult === "string" ? beforeRunResult : beforeRunResult?.details;
-  const observedMessageStartIndex = params.environment.observedMessages.length;
-  const requestStartedAt = new Date();
-  const sent = await sendSlackChannelMessage({
-    channelId: params.environment.channelId,
-    client: params.environment.context.driverClient,
-    text: params.run.input,
-    threadTs: typeof beforeRunResult === "object" ? beforeRunResult?.inputThreadTs : undefined,
-  });
-  const requestThreadTs =
-    (typeof beforeRunResult === "object" ? beforeRunResult?.inputThreadTs : undefined) ?? sent.ts;
-  if (!params.run.expectReply) {
-    await waitForSlackNoReply({
-      channelId: params.environment.channelId,
+  let scenarioContext = params.environment.context;
+  try {
+    const beforeRunResult = await params.run.beforeRun?.(params.environment.context);
+    const beforeRunDetails =
+      typeof beforeRunResult === "string" ? beforeRunResult : beforeRunResult?.details;
+    const channelId =
+      typeof beforeRunResult === "object" && beforeRunResult.inputChannelId?.trim()
+        ? beforeRunResult.inputChannelId.trim()
+        : params.environment.channelId;
+    scenarioContext = { ...params.environment.context, channelId };
+    const observedMessageStartIndex = params.environment.observedMessages.length;
+    const messageWriteCursor = await params.environment.getMessageWriteCursor();
+    const requestStartedAt = new Date();
+    const sent = await sendSlackChannelMessage({
+      channelId,
+      client: params.environment.context.driverClient,
+      text: params.run.input,
+      threadTs: typeof beforeRunResult === "object" ? beforeRunResult?.inputThreadTs : undefined,
+    });
+    const requestThreadTs =
+      (typeof beforeRunResult === "object" ? beforeRunResult?.inputThreadTs : undefined) ?? sent.ts;
+    const observation = {
+      channelId,
       client: params.environment.context.sutReadClient,
       matchText: params.run.matchText,
       observedMessages: params.environment.observedMessages,
@@ -44,66 +99,81 @@ async function runSlackMessageScenario(params: {
       observationScenarioTitle: params.scenarioTitle,
       sentTs: sent.ts,
       sutIdentity: params.environment.sutIdentity,
+    };
+    if (!params.run.expectReply) {
+      await waitForSlackNoReply({
+        ...observation,
+        timeoutMs: params.run.noReplyObservationMs ?? params.timeoutMs,
+      });
+      const afterNoReplyDetails = await params.run.afterNoReply?.({
+        ...scenarioContext,
+        sentTs: sent.ts,
+      });
+      return {
+        details: ["no reply", beforeRunDetails, afterNoReplyDetails].filter(Boolean).join("; "),
+      };
+    }
+    if (params.run.captureBeforeReply) {
+      // Native presentation identity belongs to the successful write capture. Resolve it
+      // before shared channel history can evict the earlier message while awaiting the final reply.
+      await waitForSlackPreReplyCapture({
+        capture: params.run.captureBeforeReply,
+        channelId,
+        readMessages: () => params.environment.readMessageWrites(messageWriteCursor),
+        scenarioId: params.scenarioId,
+        timeoutMs: params.timeoutMs,
+      });
+    }
+    const reply = await waitForSlackScenarioReply({
+      ...observation,
+      threadTs: requestThreadTs,
       timeoutMs: params.timeoutMs,
     });
-    const afterNoReplyDetails = await params.run.afterNoReply?.({
-      ...params.environment.context,
+    params.run.verify?.(reply.message, { requestThreadTs, sentTs: sent.ts });
+    if (params.run.settleObservedMs) {
+      await observeSlackScenarioMessages({
+        ...observation,
+        settleMs: params.run.settleObservedMs,
+        threadTs: requestThreadTs,
+      });
+    }
+    const capturedMessages = await params.environment.readMessageWrites(messageWriteCursor);
+    const observedDetails = params.run.verifyObserved?.({
+      finalMessage: reply.message,
+      messages: [
+        ...params.environment.observedMessages.slice(observedMessageStartIndex),
+        ...capturedMessages.filter((message) => message.channelId === channelId),
+      ],
+    });
+    const afterReplyDetails = await params.run.afterReply?.(reply.message, {
+      ...scenarioContext,
       sentTs: sent.ts,
     });
+    const responseObservedAt = new Date(reply.observedAt);
+    const rttMs = responseObservedAt.getTime() - requestStartedAt.getTime();
     return {
-      details: ["no reply", beforeRunDetails, afterNoReplyDetails].filter(Boolean).join("; "),
+      details: [`reply matched in ${rttMs}ms`, beforeRunDetails, observedDetails, afterReplyDetails]
+        .filter(Boolean)
+        .join("; "),
+      ...buildLiveTransportRttResult(
+        { requestStartedAt, responseObservedAt, rttMs },
+        "request-to-observed-message",
+      ),
     };
+  } finally {
+    await params.run.cleanup?.(scenarioContext);
   }
-  const reply = await waitForSlackScenarioReply({
-    channelId: params.environment.channelId,
-    client: params.environment.context.sutReadClient,
-    matchText: params.run.matchText,
-    observedMessages: params.environment.observedMessages,
-    observationScenarioId: params.scenarioId,
-    observationScenarioTitle: params.scenarioTitle,
-    sentTs: sent.ts,
-    threadTs: requestThreadTs,
-    sutIdentity: params.environment.sutIdentity,
-    timeoutMs: params.timeoutMs,
-  });
-  params.run.verify?.(reply.message, { requestThreadTs, sentTs: sent.ts });
-  if (params.run.settleObservedMs) {
-    await observeSlackScenarioMessages({
-      channelId: params.environment.channelId,
-      client: params.environment.context.sutReadClient,
-      matchText: params.run.matchText,
-      observedMessages: params.environment.observedMessages,
-      observationScenarioId: params.scenarioId,
-      observationScenarioTitle: params.scenarioTitle,
-      sentTs: sent.ts,
-      settleMs: params.run.settleObservedMs,
-      sutIdentity: params.environment.sutIdentity,
-      threadTs: requestThreadTs,
-    });
-  }
-  const observedDetails = params.run.verifyObserved?.({
-    finalMessage: reply.message,
-    messages: params.environment.observedMessages.slice(observedMessageStartIndex),
-  });
-  const afterReplyDetails = await params.run.afterReply?.(reply.message, {
-    ...params.environment.context,
-    sentTs: sent.ts,
-  });
-  const responseObservedAt = new Date(reply.observedAt);
-  const rttMs = responseObservedAt.getTime() - requestStartedAt.getTime();
-  return {
-    details: [`reply matched in ${rttMs}ms`, beforeRunDetails, observedDetails, afterReplyDetails]
-      .filter(Boolean)
-      .join("; "),
-  };
 }
 
-async function runSlackScenario(environment: SlackQaScenarioEnvironment, scenarioId: string) {
-  const scenario = getSlackQaScenarioDefinition(scenarioId);
-  const run = scenario.buildRun(environment.sutIdentity.userId);
+export async function runSlackScenario(
+  environment: SlackQaScenarioEnvironment,
+  implementation: SlackQaScenarioImplementation,
+) {
+  const scenario = environment.scenario;
+  const { cfg, primaryModel, run } = await environment.configureScenario(implementation);
   if (run.kind === "direct-transport") {
     const result = await run.execute({
-      cfg: environment.cfg,
+      cfg,
       channelId: environment.channelId,
       sutAccountId: environment.sutAccountId,
       sutIdentity: environment.sutIdentity,
@@ -115,49 +185,38 @@ async function runSlackScenario(environment: SlackQaScenarioEnvironment, scenari
     if (!message.ts) {
       throw new Error("direct Slack transport scenario returned no stored message id");
     }
-    environment.observedMessages.push({
-      actionValues: collectSlackActionValues(message.blocks),
-      blockText: collectSlackBlockText(message.blocks),
-      botId: message.bot_id,
+    recordSlackObservedMessage({
       channelId: environment.channelId,
       matchedScenario: true,
+      message,
+      observedMessages: environment.observedMessages,
       scenarioId: scenario.id,
       scenarioTitle: scenario.title,
-      text: message.text ?? "",
-      threadTs: message.thread_ts,
-      ts: message.ts,
-      userId: message.user,
     });
     return { details: result.details };
   }
-  if (run.kind === "approval") {
-    const approval = await runSlackApprovalScenario({
+  if (run.kind === "approval" || run.kind === "codex-approval") {
+    const params = {
       channelId: environment.channelId,
       context: environment.context,
       observedMessages: environment.observedMessages,
-      run,
       scenario,
       sutAccountId: environment.sutAccountId,
-    });
-    return {
-      details: `${run.approvalKind} approval resolved ${run.decision} in ${approval.rttMs}ms`,
-      artifacts: { approval: approval.artifact },
     };
-  }
-  if (run.kind === "codex-approval") {
-    const approval = await runSlackCodexApprovalScenario({
-      channelId: environment.channelId,
-      context: environment.context,
-      observedMessages: environment.observedMessages,
-      primaryModel: environment.primaryModel,
-      run,
-      scenario,
-      stopGateway: environment.stopGateway,
-      sutAccountId: environment.sutAccountId,
-    });
+    const approval =
+      run.kind === "approval"
+        ? await runSlackApprovalScenario({ ...params, run })
+        : await runSlackCodexApprovalScenario({
+            ...params,
+            primaryModel,
+            run,
+            stopGateway: environment.stopGateway,
+          });
+    const label = run.kind === "approval" ? run.approvalKind : `Codex ${run.appServerMethod}`;
     return {
-      details: `Codex ${run.appServerMethod} approval resolved ${run.decision} in ${approval.rttMs}ms`,
+      details: `${label} approval resolved ${run.decision} in ${approval.rttMs}ms`,
       artifacts: { approval: approval.artifact },
+      ...buildLiveTransportRttResult(approval, "approval-request-to-resolution"),
     };
   }
   return await runSlackMessageScenario({
@@ -168,39 +227,3 @@ async function runSlackScenario(environment: SlackQaScenarioEnvironment, scenari
     timeoutMs: scenario.timeoutMs,
   });
 }
-
-export const runSlackCanaryScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-canary");
-export const runSlackMentionGatingScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-mention-gating");
-export const runSlackAllowlistBlockScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-allowlist-block");
-export const runSlackChannelDisabledWarningScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-channel-disabled-warning");
-export const runSlackTopLevelReplyShapeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-top-level-reply-shape");
-export const runSlackProgressCommentaryTrueScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-progress-commentary-true");
-export const runSlackProgressCommentaryFalseScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-progress-commentary-false");
-export const runSlackProgressCommentaryOmittedScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-progress-commentary-omitted");
-export const runSlackProgressCommentaryVerboseDedupeScenario = (
-  context: SlackQaScenarioEnvironment,
-) => runSlackScenario(context, "slack-progress-commentary-verbose-dedupe");
-export const runSlackChartPresentationNativeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-chart-presentation-native");
-export const runSlackTablePresentationNativeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-table-presentation-native");
-export const runSlackTableInvalidBlocksFallbackScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-table-invalid-blocks-fallback");
-export const runSlackReactionGlyphNativeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-reaction-glyph-native");
-export const runSlackApprovalExecNativeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-approval-exec-native");
-export const runSlackApprovalPluginNativeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-approval-plugin-native");
-export const runSlackCodexApprovalExecNativeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-codex-approval-exec-native");
-export const runSlackCodexApprovalPluginNativeScenario = (context: SlackQaScenarioEnvironment) =>
-  runSlackScenario(context, "slack-codex-approval-plugin-native");

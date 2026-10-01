@@ -1,12 +1,9 @@
-// Google Meet plugin module implements oauth behavior.
 import {
   MAX_DATE_TIMESTAMP_MS,
   resolveDateTimestampMs,
   resolveExpiresAtMsFromDurationSeconds,
 } from "openclaw/plugin-sdk/number-runtime";
-import { generateHexPkceVerifierChallenge } from "openclaw/plugin-sdk/provider-auth";
 import {
-  generateOAuthState,
   parseOAuthCallbackInput,
   waitForLocalOAuthCallback,
 } from "openclaw/plugin-sdk/provider-auth-runtime";
@@ -206,15 +203,6 @@ export async function resolveGoogleMeetAccessToken(params: {
     expiresAt: refreshed.expiresAt,
     refreshed: true,
   };
-}
-
-export function createGoogleMeetPkce() {
-  const { verifier, challenge } = generateHexPkceVerifierChallenge();
-  return { verifier, challenge };
-}
-
-export function createGoogleMeetOAuthState(): string {
-  return generateOAuthState();
 }
 
 function isLocalCallbackListenerError(error: unknown): boolean {

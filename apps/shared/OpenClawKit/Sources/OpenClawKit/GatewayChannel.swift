@@ -2,64 +2,35 @@ import CryptoKit
 import Foundation
 import OpenClawProtocol
 import OSLog
+import Synchronization
 
 /// Avoid ambiguity with the app's own AnyCodable type.
 private typealias ProtoAnyCodable = OpenClawProtocol.AnyCodable
-
-private func gatewayErrorDetails(_ error: ErrorShape?) -> [String: ProtoAnyCodable] {
-    var details: [String: ProtoAnyCodable] = [:]
-    if let nested = error?.details?.value as? [String: ProtoAnyCodable] {
-        details.merge(nested) { _, nestedValue in nestedValue }
-    }
-    if let error {
-        if details["code"] == nil {
-            details["code"] = ProtoAnyCodable(error.code)
-        } else {
-            details["errorCode"] = ProtoAnyCodable(error.code)
-        }
-        details["message"] = ProtoAnyCodable(error.message)
-        if let retryable = error.retryable {
-            details["retryable"] = ProtoAnyCodable(retryable)
-        }
-        if let retryAfterMs = error.retryafterms {
-            details["retryAfterMs"] = ProtoAnyCodable(retryAfterMs)
-        }
-    }
-    return details
-}
-
-extension String {
-    fileprivate var nilIfEmpty: String? {
-        self.isEmpty ? nil : self
-    }
-}
 
 public actor GatewayChannelActor {
     nonisolated static func resolveRequestTimeoutMs(_ timeoutMs: Double?, defaultMs: Double) -> Double? {
         timeoutMs == 0 ? nil : (timeoutMs ?? defaultMs)
     }
 
-    nonisolated static func minimumProtocolVersion(role: String, clientMode: String) -> Int {
-        // Node RPC frames stayed compatible across v3/v4. Operator chat surfaces require v4.
-        if role == "node", clientMode == "node" {
-            return GATEWAY_MIN_NODE_PROTOCOL_VERSION
-        }
-        return GATEWAY_MIN_PROTOCOL_VERSION
+    private var supportedProtocols: ClosedRange<Int> {
+        Self.minimumProtocolVersion(
+            role: self.connectOptions?.role ?? "operator",
+            clientMode: self.connectOptions?.clientMode ?? "ui")...GATEWAY_PROTOCOL_VERSION
     }
 
     private let logger = Logger(subsystem: "ai.openclaw", category: "gateway")
     private var task: WebSocketTaskBox?
     private var activeConnectAttemptID: UUID?
-    private var pending: [String: CheckedContinuation<GatewayFrame, Error>] = [:]
+    var pending: [String: PendingRequest] = [:]
     private var connected = false
     private var connectAttemptTask: Task<Void, Never>?
     /// Socket ownership epoch. Every callback and send stays bound to the task
     /// that admitted it so a late failure cannot tear down a replacement socket.
     private var connectionGeneration: UInt64 = 0
     private var disconnectedConnectionGeneration: UInt64?
-    private var disconnectNotificationInProgress = false
+    private var disconnectError: Error?
     private var automaticReconnectRequested = false
-    private var connectWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    var connectWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var url: URL
     private var token: String?
     private var bootstrapToken: String?
@@ -67,20 +38,26 @@ public actor GatewayChannelActor {
     private let authBindingKey: SymmetricKey?
     private let session: WebSocketSessioning
     private var backoffMs: Double = 500
+    var connectFailureBackoff = GatewayConnectFailureBackoff()
     private var shouldReconnect = true
+    private nonisolated let socketAdmission = Mutex(true)
     private var lastSeq: Int?
+    private var liveTextProjection = GatewayLiveTextProjection()
     private var lastTick: Date?
     private var tickIntervalMs: Double = 30000
     private var lastAuthSource: GatewayAuthSource = .none
     private var lastAuthBinding: (generation: UInt64, binding: GatewayAuthBinding)?
+    private var acceptedHTTPBearer: (generation: UInt64, token: String?)?
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     // Remote gateways (tailscale/wan) can take longer to deliver connect.challenge.
     // Connect now requires this nonce before we send device-auth.
-    private var connectTimeoutSeconds: Double = 30
-    private var testConnectAttemptFinishedHandler: (@Sendable (UUID) -> Void)?
+    var connectTimeoutSeconds: Double = 30
+    var testConnectAttemptFinishedHandler: (@Sendable (UUID) -> Void)?
     #if DEBUG
-    private var testRequestResumedHandler: (@Sendable () async -> Void)?
+    var testConnectRunFinishedHandler: (@Sendable () -> Void)?
+    var testConnectFailureBackoffWaitHandler: (@Sendable () async throws -> Void)?
+    var testRequestResumedHandler: (@Sendable () async -> Void)?
     #endif
     private let connectChallengeTimeoutSeconds: Double = 6.0
     // Some networks will silently drop idle TCP/TLS flows around ~30s. The gateway tick is server->client,
@@ -91,10 +68,11 @@ public actor GatewayChannelActor {
     private var keepaliveTask: Task<Void, Never>?
     private var pendingDeviceTokenRetry = false
     private var deviceTokenRetryBudgetUsed = false
-    private var issuedDeviceAuthRoles = Set<String>()
+    private var receivedDeviceAuthRoles = Set<String>()
+    private var persistedDeviceAuthRoles = Set<String>()
     private var reconnectPausedForAuthFailure = false
     private let defaultRequestTimeoutMs: Double = 15000
-    private let extraHeadersProvider: (@Sendable () -> [String: String])?
+    private let extraHeadersProvider: (@Sendable () async throws -> [String: String])?
     /// Fast state admission for clients that must inspect hello before their
     /// first request. General push delivery remains asynchronous.
     private let connectSnapshotAdmissionHandler: (@Sendable (HelloOk, UInt64) async -> Void)?
@@ -113,7 +91,7 @@ public actor GatewayChannelActor {
         pushHandler: (@Sendable (GatewayPush, UInt64) async -> Void)? = nil,
         connectOptions: GatewayConnectOptions? = nil,
         disconnectHandler: (@Sendable (String, UInt64) async -> Void)? = nil,
-        extraHeadersProvider: (@Sendable () -> [String: String])? = nil)
+        extraHeadersProvider: (@Sendable () async throws -> [String: String])? = nil)
     {
         self.url = url
         self.token = token
@@ -143,31 +121,25 @@ public actor GatewayChannelActor {
         return self.lastAuthBinding?.binding
     }
 
-    func _test_setConnectTimeoutSeconds(_ seconds: Double) {
-        self.connectTimeoutSeconds = seconds
+    /// Native HTTP adapters reuse the credential accepted by this exact socket,
+    /// including stored device tokens that the hello response does not reissue.
+    public func httpResourceBearer(ifCurrentConnectionGeneration expectedGeneration: UInt64) -> String? {
+        guard self.authBinding(ifCurrentConnectionGeneration: expectedGeneration) != nil,
+              self.acceptedHTTPBearer?.generation == expectedGeneration
+        else { return nil }
+        return self.acceptedHTTPBearer?.token
     }
 
-    func _test_setConnectAttemptFinishedHandler(_ handler: (@Sendable (UUID) -> Void)?) {
-        self.testConnectAttemptFinishedHandler = handler
-    }
-
-    #if DEBUG
-    func _test_setRequestResumedHandler(_ handler: (@Sendable () async -> Void)?) {
-        self.testRequestResumedHandler = handler
-    }
-    #endif
-
-    func _test_pendingRequestCount() -> Int {
-        self.pending.count
-    }
-
-    func _test_connectWaiterCount() -> Int {
-        self.connectWaiters.count
+    nonisolated func retireSocketAdmission() {
+        self.socketAdmission.withLock { $0 = false }
     }
 
     public func shutdown() async {
+        self.retireSocketAdmission()
         self.shouldReconnect = false
         self.connected = false
+        self.liveTextProjection.reset()
+        self.acceptedHTTPBearer = nil
         self.activeConnectAttemptID = nil
         self.automaticReconnectRequested = false
         self.connectAttemptTask?.cancel()
@@ -188,7 +160,7 @@ public actor GatewayChannelActor {
         self.task?.cancel(with: .goingAway, reason: nil)
         self.task = nil
 
-        await self.failPending(NSError(
+        self.failPending(NSError(
             domain: "Gateway",
             code: 0,
             userInfo: [NSLocalizedDescriptionKey: "gateway channel shutdown"]))
@@ -240,14 +212,26 @@ public actor GatewayChannelActor {
     /// Operator-supplied proxy credentials (Cloudflare Access-style) ride on the upgrade
     /// request. Read from the provider at connect time so edits apply on the next reconnect
     /// without re-pairing. Values are credentials: never log them.
-    private func makeUpgradeRequest() -> URLRequest {
+    private var workerEdgeCredentials: [String: String]?
+
+    func currentWorkerEdgeCredentials() -> [String: String]? {
+        self.workerEdgeCredentials
+    }
+
+    private func makeUpgradeRequest() async throws -> URLRequest {
+        self.workerEdgeCredentials = nil
         var request = URLRequest(url: self.url)
         // Custom headers can contain service tokens or Authorization values. Do not even read
         // the provider for cleartext routes, where credentials would be exposed in transit.
         guard self.url.scheme?.lowercased() == "wss" else { return request }
-        guard let headers = self.extraHeadersProvider?(), !headers.isEmpty else { return request }
+        guard let headers = try await self.extraHeadersProvider?(), !headers.isEmpty else { return request }
         for (name, value) in GatewayCustomHeaders.sanitized(headers) {
             request.setValue(value, forHTTPHeaderField: name)
+        }
+        if let clientID = request.value(forHTTPHeaderField: "CF-Access-Client-Id"),
+           let clientSecret = request.value(forHTTPHeaderField: "CF-Access-Client-Secret")
+        {
+            self.workerEdgeCredentials = ["clientId": clientID, "clientSecret": clientSecret]
         }
         return request
     }
@@ -260,12 +244,7 @@ public actor GatewayChannelActor {
                 code: 6,
                 userInfo: [NSLocalizedDescriptionKey: "gateway channel is shut down"])
         }
-        guard !self.disconnectNotificationInProgress else {
-            throw NSError(
-                domain: "Gateway",
-                code: 6,
-                userInfo: [NSLocalizedDescriptionKey: "gateway disconnect cleanup in progress"])
-        }
+        if let disconnectError { throw disconnectError }
         if self.connected, self.task?.state == .running {
             return
         }
@@ -284,6 +263,9 @@ public actor GatewayChannelActor {
         } catch {
             self.finishConnectAttempt(error: error)
         }
+        #if DEBUG
+        self.testConnectRunFinishedHandler?()
+        #endif
     }
 
     private func waitForConnectAttempt() async throws {
@@ -323,7 +305,11 @@ public actor GatewayChannelActor {
 
     private func performConnectAttempt() async throws {
         guard self.shouldReconnect else { throw CancellationError() }
-        guard !self.disconnectNotificationInProgress else { throw CancellationError() }
+        if let disconnectError { throw disconnectError }
+        try await self.waitForConnectFailureBackoff()
+        try Task.checkCancellation()
+        guard self.shouldReconnect else { throw CancellationError() }
+        if let disconnectError { throw disconnectError }
         if self.connected {
             if self.task?.state == .running { return }
             let staleGeneration = self.connectionGeneration
@@ -343,24 +329,32 @@ public actor GatewayChannelActor {
             guard self.shouldReconnect else { throw CancellationError() }
         }
 
-        self.connectionGeneration &+= 1
-        let connectionGeneration = self.connectionGeneration
+        // External authorization can suspend. A canceled route must never create a socket
+        // with a grant returned after its disconnect or replacement.
+        let request = try await self.makeUpgradeRequest()
+        try Task.checkCancellation()
+        guard self.shouldReconnect else { throw CancellationError() }
+        if let disconnectError { throw disconnectError }
         self.task?.cancel(with: .goingAway, reason: nil)
-        let attemptID = UUID()
-        let connectTask = self.session.makeWebSocketTask(request: self.makeUpgradeRequest())
-        self.activeConnectAttemptID = attemptID
-        self.task = connectTask
-        connectTask.resume()
+        // Native route retirement cannot await this actor. Order it against the whole
+        // synchronous socket admission, including resume; keep transport cleanup outside.
+        let (connectTask, attemptID, connectionGeneration) = try self.socketAdmission.withLock { allowed in
+            guard allowed else { throw CancellationError() }
+            self.connectionGeneration &+= 1
+            let attemptID = UUID()
+            let connectTask = self.session.makeWebSocketTask(request: request)
+            self.activeConnectAttemptID = attemptID
+            self.task = connectTask
+            connectTask.resume()
+            return (connectTask, attemptID, self.connectionGeneration)
+        }
         let connectHello: HelloOk
         do {
             connectHello = try await AsyncTimeout.withTimeout(
                 seconds: self.connectTimeoutSeconds,
-                onTimeout: {
-                    NSError(
-                        domain: "Gateway",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "connect timed out"])
-                },
+                // A handshake deadline is a transport failure, just like a URLSession
+                // timeout. Keep it typed so endpoint failover can distinguish auth rejection.
+                onTimeout: { URLError(.timedOut) },
                 operation: {
                     try await self.sendConnect(
                         task: connectTask,
@@ -375,6 +369,10 @@ public actor GatewayChannelActor {
             } else {
                 self.wrap(error, context: "connect to gateway @ \(self.url.absoluteString)")
             }
+            self.connectFailureBackoff.record(
+                error: error,
+                pendingDeviceTokenRetry: self.pendingDeviceTokenRetry,
+                supportedProtocols: self.supportedProtocols)
             await self.transitionToDisconnected(
                 reason: "connect failed: \(wrapped.localizedDescription)",
                 error: wrapped,
@@ -392,7 +390,9 @@ public actor GatewayChannelActor {
         self.automaticReconnectRequested = false
         self.reconnectPausedForAuthFailure = false
         self.backoffMs = 500
+        self.connectFailureBackoff.reset()
         self.lastSeq = nil
+        self.liveTextProjection.reset()
         self.listen(connectionGeneration: connectionGeneration)
         self.startTickWatchdog(connectionGeneration: connectionGeneration)
         self.startKeepalive(connectionGeneration: connectionGeneration)
@@ -418,8 +418,7 @@ public actor GatewayChannelActor {
             guard await self.sleepUnlessCancelled(
                 nanoseconds: UInt64(self.keepaliveIntervalSeconds * 1_000_000_000))
             else { return }
-            guard self.shouldReconnect else { return }
-            guard self.isConnected(connectionGeneration: connectionGeneration) else { return }
+            guard self.shouldReconnect, self.isConnected(connectionGeneration: connectionGeneration) else { return }
             guard let task = self.task else { continue }
             // Best-effort ping keeps NAT/proxy state alive without generating RPC load.
             do {
@@ -430,18 +429,12 @@ public actor GatewayChannelActor {
         }
     }
 
-    private static func loadDeviceIdentityForConnect(
+    static func loadDeviceIdentityForConnect(
         includeDeviceIdentity: Bool,
         profile: GatewayDeviceIdentityProfile) throws -> DeviceIdentity?
     {
         guard includeDeviceIdentity else { return nil }
-        guard let identity = DeviceIdentityStore.loadOrCreatePersisted(profile: profile) else {
-            throw NSError(
-                domain: "Gateway",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "Could not access the persisted device identity"])
-        }
-        return identity
+        return try DeviceIdentityStore.loadOrCreatePersistedOrThrow(profile: profile)
     }
 
     private func sendConnect(
@@ -457,7 +450,7 @@ public actor GatewayChannelActor {
         let options = self.connectOptions ?? GatewayConnectOptions(
             role: "operator",
             scopes: Self.defaultOperatorConnectScopes,
-            caps: [],
+            caps: [OpenClawGatewayClientCapability.ultrafast],
             commands: [],
             permissions: [:],
             clientId: "openclaw-macos",
@@ -467,7 +460,7 @@ public actor GatewayChannelActor {
         let clientId = options.clientId
         let clientMode = options.clientMode
         let role = options.role
-        let minProtocol = Self.minimumProtocolVersion(role: role, clientMode: clientMode)
+        let protocols = self.supportedProtocols
         let deviceIdentityProfile = options.deviceIdentityProfile
         let requestedScopes = options.scopes
         let scopesAreExplicit = options.scopesAreExplicit
@@ -497,8 +490,8 @@ public actor GatewayChannelActor {
             displayName: clientDisplayName,
             platform: platform)
         var params: [String: ProtoAnyCodable] = [
-            "minProtocol": ProtoAnyCodable(minProtocol),
-            "maxProtocol": ProtoAnyCodable(GATEWAY_PROTOCOL_VERSION),
+            "minProtocol": ProtoAnyCodable(protocols.lowerBound),
+            "maxProtocol": ProtoAnyCodable(protocols.upperBound),
             "client": ProtoAnyCodable(client),
             "caps": ProtoAnyCodable(options.caps),
             "locale": ProtoAnyCodable(primaryLocale),
@@ -506,22 +499,15 @@ public actor GatewayChannelActor {
             "role": ProtoAnyCodable(role),
             "scopes": ProtoAnyCodable(scopes),
         ]
-        if !options.commands.isEmpty {
-            params["commands"] = ProtoAnyCodable(options.commands)
-        }
-        if let pathEnv = options.pathEnv?.trimmingCharacters(in: .whitespacesAndNewlines), !pathEnv.isEmpty {
-            params["pathEnv"] = ProtoAnyCodable(pathEnv)
-        }
-        if !options.permissions.isEmpty {
-            params["permissions"] = ProtoAnyCodable(options.permissions)
-        }
+        options.applyOptionalConnectParams(to: &params)
         self.applyConnectAuth(
             selectedAuth,
             deviceId: identity?.deviceId,
             connectionGeneration: connectionGeneration,
             to: &params)
-        let signedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let connectNonce = try await self.waitForConnectChallenge(task: task, attemptID: attemptID)
+        let connectChallenge = try await self.waitForConnectChallenge(task: task, attemptID: attemptID)
+        let signedAtMs = connectChallenge.issuedAtMs
+        let connectNonce = connectChallenge.nonce
         try self.ensureCurrentConnectAttempt(attemptID, task: task)
         try self.requireCurrentConnection(connectionGeneration)
         if includeDeviceIdentity, let identity {
@@ -563,12 +549,12 @@ public actor GatewayChannelActor {
             let outcome = try await self.handleConnectResponse(
                 response,
                 identity: identity,
-                role: role,
-                deviceAuthGatewayID: deviceAuthGatewayID,
-                deviceIdentityProfile: deviceIdentityProfile,
+                selectedAuth: selectedAuth,
+                options: options,
                 connectionGeneration: connectionGeneration)
-            self.issuedDeviceAuthRoles.formUnion(outcome.issuedRoles)
-            if outcome.issuedRoles.contains(role) {
+            self.receivedDeviceAuthRoles.formUnion(outcome.receivedRoles)
+            self.persistedDeviceAuthRoles.formUnion(outcome.persistedRoles)
+            if outcome.persistedRoles.contains(role) {
                 // Only a token persisted from this endpoint may unlock stored auth for its role.
                 self.connectOptions?.allowStoredDeviceAuth = true
             }
@@ -580,7 +566,7 @@ public actor GatewayChannelActor {
             try self.requireCurrentConnection(connectionGeneration)
             let shouldRetryWithDeviceToken = self.shouldRetryWithStoredDeviceToken(
                 error: error,
-                explicitGatewayToken: self.token?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                explicitGatewayToken: self.token?.trimmedNonEmpty,
                 storedToken: selectedAuth.storedToken,
                 attemptedDeviceTokenRetry: selectedAuth.authDeviceToken != nil)
             if shouldRetryWithDeviceToken {
@@ -652,10 +638,9 @@ extension GatewayChannelActor {
         deviceId: String?,
         requestedScopes: [String]) -> SelectedConnectAuth
     {
-        let explicitToken = self.token?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        let explicitBootstrapToken =
-            self.bootstrapToken?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        let explicitPassword = self.password?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let explicitToken = self.token?.trimmedNonEmpty
+        let explicitBootstrapToken = self.bootstrapToken?.trimmedNonEmpty
+        let explicitPassword = self.password?.trimmedNonEmpty
         let storedEntry =
             (includeDeviceIdentity && allowStoredDeviceAuth && deviceId != nil)
             ? DeviceAuthStore.loadToken(
@@ -903,51 +888,35 @@ extension GatewayChannelActor {
     private func handleConnectResponse(
         _ res: ResponseFrame,
         identity: DeviceIdentity?,
-        role: String,
-        deviceAuthGatewayID: String?,
-        deviceIdentityProfile: GatewayDeviceIdentityProfile,
-        connectionGeneration: UInt64) async throws -> (issuedRoles: Set<String>, hello: HelloOk)
+        selectedAuth: SelectedConnectAuth,
+        options: GatewayConnectOptions,
+        connectionGeneration: UInt64) async throws
+        -> (receivedRoles: Set<String>, persistedRoles: Set<String>, hello: HelloOk)
     {
+        let role = options.role
+        let deviceAuthGatewayID = options.deviceAuthGatewayID
+        let deviceIdentityProfile = options.deviceIdentityProfile
         if res.ok == false {
-            let error = res.error
-            let msg = error?.message ?? "gateway connect failed"
-            let details = gatewayErrorDetails(error)
-            let detailCode = details["code"]?.value as? String
-            let canRetryWithDeviceToken = details["canRetryWithDeviceToken"]?.value as? Bool ?? false
-            let recommendedNextStep = details["recommendedNextStep"]?.value as? String
-            let requestId = details["requestId"]?.value as? String
-            let reason = details["reason"]?.value as? String
-            let owner = details["owner"]?.value as? String
-            let title = details["title"]?.value as? String
-            let userMessage = details["userMessage"]?.value as? String
-            let actionLabel = details["actionLabel"]?.value as? String
-            let actionCommand = details["actionCommand"]?.value as? String
-            let docsURLString = details["docsUrl"]?.value as? String
-            let retryableOverride = details["retryable"]?.value as? Bool
-            let pauseReconnectOverride = details["pauseReconnect"]?.value as? Bool
-            let clientMinProtocol = gatewayIntValue(details["clientMinProtocol"]?.value)
-            let clientMaxProtocol = gatewayIntValue(details["clientMaxProtocol"]?.value)
-            let expectedProtocol = gatewayIntValue(details["expectedProtocol"]?.value)
-            let minimumProbeProtocol = gatewayIntValue(details["minimumProbeProtocol"]?.value)
+            let details = gatewayErrorDetails(res.error)
             throw GatewayConnectAuthError(
-                message: msg,
-                detailCodeRaw: detailCode,
-                canRetryWithDeviceToken: canRetryWithDeviceToken,
-                recommendedNextStepRaw: recommendedNextStep,
-                requestId: requestId,
-                detailsReason: reason,
-                ownerRaw: owner,
-                titleOverride: title,
-                userMessageOverride: userMessage,
-                actionLabel: actionLabel,
-                actionCommand: actionCommand,
-                docsURLString: docsURLString,
-                retryableOverride: retryableOverride,
-                pauseReconnectOverride: pauseReconnectOverride,
-                clientMinProtocol: clientMinProtocol,
-                clientMaxProtocol: clientMaxProtocol,
-                expectedProtocol: expectedProtocol,
-                minimumProbeProtocol: minimumProbeProtocol)
+                message: res.error?.message ?? "gateway connect failed",
+                detailCodeRaw: details["code"]?.value as? String,
+                canRetryWithDeviceToken: details["canRetryWithDeviceToken"]?.value as? Bool ?? false,
+                recommendedNextStepRaw: details["recommendedNextStep"]?.value as? String,
+                requestId: details["requestId"]?.value as? String,
+                detailsReason: details["reason"]?.value as? String,
+                ownerRaw: details["owner"]?.value as? String,
+                titleOverride: details["title"]?.value as? String,
+                userMessageOverride: details["userMessage"]?.value as? String,
+                actionLabel: details["actionLabel"]?.value as? String,
+                actionCommand: details["actionCommand"]?.value as? String,
+                docsURLString: details["docsUrl"]?.value as? String,
+                retryableOverride: details["retryable"]?.value as? Bool,
+                pauseReconnectOverride: details["pauseReconnect"]?.value as? Bool,
+                clientMinProtocol: gatewayIntValue(details["clientMinProtocol"]?.value),
+                clientMaxProtocol: gatewayIntValue(details["clientMaxProtocol"]?.value),
+                expectedProtocol: gatewayIntValue(details["expectedProtocol"]?.value),
+                minimumProbeProtocol: gatewayIntValue(details["minimumProbeProtocol"]?.value))
         }
         guard let payload = res.payload else {
             throw NSError(
@@ -957,55 +926,55 @@ extension GatewayChannelActor {
         }
         let payloadData = try self.encoder.encode(payload)
         let ok = try decoder.decode(HelloOk.self, from: payloadData)
-        if let tick = ok.policy["tickIntervalMs"]?.value as? Double {
+        if let tick = ok.policy["tickIntervalMs"]?.doubleValue {
             self.tickIntervalMs = tick
-        } else if let tick = ok.policy["tickIntervalMs"]?.value as? Int {
-            self.tickIntervalMs = Double(tick)
         }
         let auth = ok.auth
-        var issuedRoles = Set<String>()
-        if let identity {
-            if let deviceToken = auth["deviceToken"]?.value as? String {
-                let authRole = auth["role"]?.value as? String ?? role
-                let scopes = (auth["scopes"]?.value as? [ProtoAnyCodable])?
-                    .compactMap { $0.value as? String } ?? []
-                if self.persistIssuedDeviceToken(
-                    authSource: self.lastAuthSource,
-                    deviceId: identity.deviceId,
-                    role: authRole,
-                    token: deviceToken,
-                    scopes: scopes,
-                    deviceAuthGatewayID: deviceAuthGatewayID,
-                    deviceIdentityProfile: deviceIdentityProfile)
-                {
-                    issuedRoles.insert(authRole)
-                }
-            }
-            if self.shouldPersistBootstrapHandoffTokens(),
-               let tokenEntries = auth["deviceTokens"]?.value as? [ProtoAnyCodable]
+        var receivedRoles = Set<String>()
+        var persistedRoles = Set<String>()
+        if let deviceToken = auth["deviceToken"]?.stringValue {
+            let authRole = auth["role"]?.stringValue ?? role
+            receivedRoles.insert(authRole)
+            let helloScopes = auth["scopes"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            let sameStoredToken = authRole == role && deviceToken == selectedAuth.storedToken
+            // Hello scopes describe this socket. Reissuing the stored token must not narrow its reusable grant.
+            let scopes = sameStoredToken ? (selectedAuth.storedScopes ?? helloScopes) : helloScopes
+            if let identity, options.allowsDeviceAuthPersistence, self.persistIssuedDeviceToken(
+                authSource: self.lastAuthSource,
+                deviceId: identity.deviceId,
+                role: authRole,
+                token: deviceToken,
+                scopes: scopes,
+                deviceAuthGatewayID: deviceAuthGatewayID,
+                deviceIdentityProfile: deviceIdentityProfile)
             {
-                for entry in tokenEntries {
-                    guard let rawEntry = entry.value as? [String: ProtoAnyCodable],
-                          let deviceToken = rawEntry["deviceToken"]?.value as? String,
-                          let authRole = rawEntry["role"]?.value as? String
-                    else {
-                        continue
-                    }
-                    let scopes = (rawEntry["scopes"]?.value as? [ProtoAnyCodable])?
-                        .compactMap { $0.value as? String } ?? []
-                    if self.persistBootstrapHandoffToken(
-                        deviceId: identity.deviceId,
-                        role: authRole,
-                        token: deviceToken,
-                        scopes: scopes,
-                        deviceAuthGatewayID: deviceAuthGatewayID,
-                        deviceIdentityProfile: deviceIdentityProfile)
-                    {
-                        issuedRoles.insert(authRole)
-                    }
+                persistedRoles.insert(authRole)
+            }
+        }
+        if let tokenEntries = auth["deviceTokens"]?.arrayValue {
+            for entry in tokenEntries {
+                guard let rawEntry = entry.dictionaryValue,
+                      let deviceToken = rawEntry["deviceToken"]?.stringValue,
+                      let authRole = rawEntry["role"]?.stringValue
+                else {
+                    continue
+                }
+                let scopes = rawEntry["scopes"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                receivedRoles.insert(authRole)
+                if let identity, options.allowsDeviceAuthPersistence, self.shouldPersistBootstrapHandoffTokens(),
+                   self.persistBootstrapHandoffToken(
+                       deviceId: identity.deviceId,
+                       role: authRole,
+                       token: deviceToken,
+                       scopes: scopes,
+                       deviceAuthGatewayID: deviceAuthGatewayID,
+                       deviceIdentityProfile: deviceIdentityProfile)
+                {
+                    persistedRoles.insert(authRole)
                 }
             }
         }
+        self.acceptedHTTPBearer = (connectionGeneration, selectedAuth.httpResourceBearer(hello: ok, role: role))
         self.lastTick = Date()
         // Keep arbitrary push/lifecycle callbacks off the connect critical path.
         // Clients needing immediate hello state get a dedicated short admission.
@@ -1014,7 +983,7 @@ extension GatewayChannelActor {
         {
             await self.connectSnapshotAdmissionHandler?(ok, connectionGeneration)
         }
-        return (issuedRoles, ok)
+        return (receivedRoles, persistedRoles, ok)
     }
 
     private func deliverPushIfCurrent(
@@ -1027,8 +996,10 @@ extension GatewayChannelActor {
         await self.pushHandler?(push, connectionGeneration)
     }
 
-    public func currentIssuedDeviceAuthRoles() -> Set<String> {
-        self.issuedDeviceAuthRoles
+    public func currentDeviceAuthRoles() -> (received: Set<String>, persisted: Set<String>) {
+        // Missing issuance and failed storage need different recovery guidance. Only
+        // persisted roles may authorize reconnecting with stored device credentials.
+        (self.receivedDeviceAuthRoles, self.persistedDeviceAuthRoles)
     }
 }
 
@@ -1085,6 +1056,8 @@ extension GatewayChannelActor {
         // receive failure. Only the owner notifies lifecycle cleanup or reconnects.
         self.disconnectedConnectionGeneration = connectionGeneration
         self.connected = false
+        self.liveTextProjection.reset()
+        self.acceptedHTTPBearer = nil
         self.activeConnectAttemptID = nil
         if shouldReconnect {
             self.automaticReconnectRequested = true
@@ -1092,12 +1065,14 @@ extension GatewayChannelActor {
         let disconnectedTask = self.task
         self.task = nil
         disconnectedTask?.cancel(with: .goingAway, reason: nil)
-        self.disconnectNotificationInProgress = true
+        // Refuse reconnect until cleanup finishes, retaining the cause so callers
+        // can distinguish a retryable transport loss from an authoritative rejection.
+        self.disconnectError = error
         // Lifecycle callbacks may be awaiting an RPC on this same socket. Release
         // those continuations before the callback barrier, or disconnect cycles.
-        await self.failPending(error)
+        self.failPending(error)
         await self.disconnectHandler?(reason, connectionGeneration)
-        self.disconnectNotificationInProgress = false
+        self.disconnectError = nil
 
         guard self.automaticReconnectRequested,
               self.shouldReconnect,
@@ -1119,59 +1094,81 @@ extension GatewayChannelActor {
         connectionGeneration: UInt64) async
     {
         guard self.isConnected(connectionGeneration: connectionGeneration) else { return }
-        let data: Data? = switch msg {
-        case let .data(d): d
-        case let .string(s): s.data(using: .utf8)
-        @unknown default: nil
-        }
-        guard let data else { return }
+        guard let data = self.decodeMessageData(msg) else { return }
         guard let frame = try? self.decoder.decode(GatewayFrame.self, from: data) else {
             self.logger.error("gateway decode failed")
             return
         }
         switch frame {
         case let .res(res):
-            let id = res.id
-            if let waiter = pending.removeValue(forKey: id) {
-                waiter.resume(returning: .res(res))
-            }
+            self.finishRequest(id: res.id, result: .success(.res(res)))
         case let .event(evt):
             if evt.event == "connect.challenge" { return }
             if let seq = evt.seq {
                 if let last = lastSeq, seq > last + 1 {
+                    if GatewayPush.event(evt).isTerminalChatEvent,
+                       let terminal = self.liveTextProjection.project(evt)
+                    {
+                        await self.pushHandler?(.event(terminal), connectionGeneration)
+                    }
+                    // Terminal delivery can retire this socket while its callback is suspended.
+                    guard self.isConnected(connectionGeneration: connectionGeneration) else { return }
                     await self.pushHandler?(
                         .seqGap(expected: last + 1, received: seq),
                         connectionGeneration)
-                    // The gap callback can suspend for UI/state recovery. A socket
-                    // loss during that hop must not admit the old socket's event
-                    // under the replacement connection's fresh lifecycle epoch.
-                    guard self.isConnected(connectionGeneration: connectionGeneration) else { return }
+                    let error = NSError(
+                        domain: "Gateway",
+                        code: 8,
+                        userInfo: [NSLocalizedDescriptionKey: "gateway event sequence gap"])
+                    await self.transitionToDisconnected(
+                        reason: error.localizedDescription,
+                        error: error,
+                        connectionGeneration: connectionGeneration,
+                        shouldReconnect: true)
+                    return
                 }
                 self.lastSeq = seq
             }
             if evt.event == "tick" { self.lastTick = Date() }
-            await self.pushHandler?(.event(evt), connectionGeneration)
+            guard let projected = self.liveTextProjection.project(evt) else {
+                let error = NSError(
+                    domain: "Gateway",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "gateway live text baseline missing"])
+                await self.transitionToDisconnected(
+                    reason: error.localizedDescription,
+                    error: error,
+                    connectionGeneration: connectionGeneration,
+                    shouldReconnect: true)
+                return
+            }
+            await self.pushHandler?(.event(projected), connectionGeneration)
         default:
             break
         }
     }
 
-    private func waitForConnectChallenge(task: WebSocketTaskBox, attemptID: UUID) async throws -> String {
+    private func waitForConnectChallenge(
+        task: WebSocketTaskBox,
+        attemptID: UUID) async throws -> GatewayConnectChallenge
+    {
         try await AsyncTimeout.withTimeout(
             seconds: self.connectChallengeTimeoutSeconds,
-            onTimeout: { ConnectChallengeError.timeout },
+            onTimeout: { URLError(.timedOut) },
             operation: { [weak self] in
-                guard let self else { throw ConnectChallengeError.timeout }
+                guard let self else { throw CancellationError() }
                 while true {
                     let msg = try await task.receive()
                     try await self.ensureCurrentConnectAttempt(attemptID, task: task)
                     guard let data = self.decodeMessageData(msg) else { continue }
                     guard let frame = try? self.decoder.decode(GatewayFrame.self, from: data) else { continue }
-                    if case let .event(evt) = frame, evt.event == "connect.challenge",
-                       let payload = evt.payload?.value as? [String: ProtoAnyCodable],
-                       let nonce = GatewayConnectChallengeSupport.nonce(from: payload)
-                    {
-                        return nonce
+                    if case let .event(evt) = frame, evt.event == "connect.challenge" {
+                        guard let payload = evt.payload?.value as? [String: ProtoAnyCodable],
+                              let challenge = GatewayConnectChallengeSupport.challenge(from: payload)
+                        else {
+                            throw ConnectChallengeError.invalid
+                        }
+                        return challenge
                     }
                 }
             })
@@ -1278,8 +1275,13 @@ extension GatewayChannelActor {
             }
             let wrapped = self.wrap(error, context: "gateway reconnect")
             self.logger.error("gateway reconnect failed \(wrapped.localizedDescription, privacy: .public)")
-            // connect() transfers retry ownership to the generation that failed.
-            // This task must not start a second backoff loop for the same socket.
+            // A pre-socket provider failure leaves this generation owning retries.
+            // Once a new socket exists, its disconnect transition owns the next attempt.
+            if self.connectionGeneration == connectionGeneration {
+                Task { [weak self] in
+                    await self?.scheduleReconnect(after: connectionGeneration)
+                }
+            }
         }
     }
 
@@ -1289,10 +1291,7 @@ extension GatewayChannelActor {
         storedToken: String?,
         attemptedDeviceTokenRetry: Bool) -> Bool
     {
-        if self.deviceTokenRetryBudgetUsed {
-            return false
-        }
-        if attemptedDeviceTokenRetry {
+        if self.deviceTokenRetryBudgetUsed || attemptedDeviceTokenRetry {
             return false
         }
         guard explicitGatewayToken != nil, storedToken != nil else {
@@ -1370,7 +1369,7 @@ extension GatewayChannelActor {
         timeoutMs: Double? = nil) async throws -> Data
     {
         try Task.checkCancellation()
-        try await self.connectOrThrow(context: "gateway connect")
+        try await self.connect()
         try Task.checkCancellation()
         let connectionGeneration = self.connectionGeneration
         guard self.isConnected(connectionGeneration: connectionGeneration),
@@ -1439,25 +1438,34 @@ extension GatewayChannelActor {
                         cont.resume(throwing: CancellationError())
                         return
                     }
-                    self.pending[payload.id] = cont
+                    var request = PendingRequest(continuation: cont)
                     if let effectiveTimeout {
-                        Task { [weak self] in
+                        request.timeoutTask = Task { [weak self] in
                             guard let self else { return }
-                            try? await Task.sleep(nanoseconds: UInt64(effectiveTimeout * 1_000_000))
-                            await self.timeoutRequest(id: payload.id, timeoutMs: effectiveTimeout)
+                            guard await self.sleepUnlessCancelled(
+                                nanoseconds: UInt64(effectiveTimeout * 1_000_000))
+                            else { return }
+                            let error = NSError(
+                                domain: "Gateway",
+                                code: 5,
+                                userInfo: [NSLocalizedDescriptionKey:
+                                    "gateway request timed out after \(Int(effectiveTimeout))ms"])
+                            await self.finishRequest(id: payload.id, result: .failure(error))
                         }
                     }
+                    self.pending[payload.id] = request
+                    let transportLifetime = request.transportLifetime
                     Task {
                         guard !cancellationGate.isCancelled else {
-                            self.cancelRequest(id: payload.id)
+                            self.finishRequest(id: payload.id, result: .failure(CancellationError()))
                             return
                         }
                         do {
-                            try await task.send(.data(payload.data))
+                            try await task.sendRequest(.data(payload.data), lifetime: transportLifetime)
                         } catch is CancellationError {
                             // Cancellation owns only this request. Treating it as socket loss
                             // starts disconnect cleanup and can reject an immediate safe retry.
-                            self.cancelRequest(id: payload.id)
+                            self.finishRequest(id: payload.id, result: .failure(CancellationError()))
                         } catch {
                             let wrapped = self.wrap(error, context: "gateway send \(method)")
                             await self.transitionToDisconnected(
@@ -1470,7 +1478,7 @@ extension GatewayChannelActor {
                 }
             } onCancel: {
                 cancellationGate.cancel()
-                Task { await self.cancelRequest(id: payload.id) }
+                Task { await self.finishRequest(id: payload.id, result: .failure(CancellationError())) }
             }
         } catch {
             #if DEBUG
@@ -1505,7 +1513,7 @@ extension GatewayChannelActor {
 
     public func send(method: String, params: [String: AnyCodable]?) async throws {
         try Task.checkCancellation()
-        try await self.connectOrThrow(context: "gateway connect")
+        try await self.connect()
         try Task.checkCancellation()
         try await self.send(
             method: method,
@@ -1584,14 +1592,6 @@ extension GatewayChannelActor {
         return NSError(domain: ns.domain, code: ns.code, userInfo: [NSLocalizedDescriptionKey: "\(context): \(desc)"])
     }
 
-    private func connectOrThrow(context: String) async throws {
-        do {
-            try await self.connect()
-        } catch {
-            throw self.wrap(error, context: context)
-        }
-    }
-
     private func encodeRequest(
         method: String,
         params: [String: AnyCodable]?,
@@ -1599,12 +1599,7 @@ extension GatewayChannelActor {
     {
         let id = UUID().uuidString
         // Encode request using the generated models to avoid JSONSerialization/ObjC bridging pitfalls.
-        let paramsObject: ProtoAnyCodable? = params.map { entries in
-            let dict = entries.reduce(into: [String: ProtoAnyCodable]()) { dict, entry in
-                dict[entry.key] = ProtoAnyCodable(entry.value.value)
-            }
-            return ProtoAnyCodable(dict)
-        }
+        let paramsObject = params.map(ProtoAnyCodable.init)
         let frame = RequestFrame(
             type: "req",
             id: id,
@@ -1621,26 +1616,18 @@ extension GatewayChannelActor {
         }
     }
 
-    private func failPending(_ error: Error) async {
-        let waiters = self.pending
-        self.pending.removeAll()
-        for (_, waiter) in waiters {
-            waiter.resume(throwing: error)
+    private func failPending(_ error: Error) {
+        for id in Array(self.pending.keys) {
+            self.finishRequest(id: id, result: .failure(error))
         }
     }
 
-    private func timeoutRequest(id: String, timeoutMs: Double) async {
-        guard let waiter = self.pending.removeValue(forKey: id) else { return }
-        let err = NSError(
-            domain: "Gateway",
-            code: 5,
-            userInfo: [NSLocalizedDescriptionKey: "gateway request timed out after \(Int(timeoutMs))ms"])
-        waiter.resume(throwing: err)
-    }
-
-    private func cancelRequest(id: String) {
-        guard let waiter = self.pending.removeValue(forKey: id) else { return }
-        waiter.resume(throwing: CancellationError())
+    private func finishRequest(id: String, result: Result<GatewayFrame, Error>) {
+        guard let request = self.pending.removeValue(forKey: id) else { return }
+        // A deadline belongs to its pending request, including after caller cancellation or disconnect.
+        request.timeoutTask?.cancel()
+        request.transportLifetime.finish()
+        request.continuation.resume(with: result)
     }
 
     private func cancelConnectWaiter(id: UUID) {
@@ -1648,5 +1635,3 @@ extension GatewayChannelActor {
         waiter.resume(throwing: CancellationError())
     }
 }
-
-// Intentionally no `GatewayChannel` wrapper: the app should use the single shared `GatewayConnection`.

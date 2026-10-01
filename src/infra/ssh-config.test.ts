@@ -1,6 +1,7 @@
 // Tests SSH config parsing and canonical command execution.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runCommandWithTimeout } from "../process/exec.js";
+import { resolveSshClient } from "./ssh-client.js";
 import {
   parseSshConfigOutput,
   resolveSshConfig,
@@ -11,7 +12,12 @@ vi.mock("../process/exec.js", () => ({
   runCommandWithTimeout: vi.fn(),
 }));
 
+vi.mock("./ssh-client.js", () => ({
+  resolveSshClient: vi.fn(() => "/usr/bin/ssh"),
+}));
+
 const runCommandMock = vi.mocked(runCommandWithTimeout);
+const resolveSshClientMock = vi.mocked(resolveSshClient);
 const sshOutput = [
   "user steipete",
   "hostname peters-mac-studio-1.sheep-coho.ts.net",
@@ -39,18 +45,8 @@ describe("ssh-config", () => {
   beforeEach(() => {
     runCommandMock.mockReset();
     runCommandMock.mockResolvedValue(commandResult());
-  });
-
-  it("parses ssh -G output", () => {
-    const parsed = parseSshConfigOutput(
-      "user bob\nhostname example.com\nport 2222\nidentityfile none\nidentityfile /tmp/id\n",
-    );
-    expect(parsed).toEqual({
-      user: "bob",
-      host: "example.com",
-      port: 2222,
-      identityFiles: ["/tmp/id"],
-    });
+    resolveSshClientMock.mockReset();
+    resolveSshClientMock.mockReturnValue("/usr/bin/ssh");
   });
 
   it("ignores invalid ports and blank lines", () => {
@@ -78,6 +74,7 @@ describe("ssh-config", () => {
         terminateOnOutputLimit: true,
       }),
     );
+    expect(resolveSshClientMock).toHaveBeenCalledOnce();
   });
 
   it("adds non-default port and trimmed identity arguments", async () => {
@@ -110,5 +107,12 @@ describe("ssh-config", () => {
   it("returns null when command launch fails", async () => {
     runCommandMock.mockRejectedValueOnce(new Error("spawn boom"));
     await expect(resolveSshConfig({ user: "me", host: "bad-host", port: 22 })).resolves.toBeNull();
+  });
+
+  it("returns null without launching when no trusted SSH client is installed", async () => {
+    resolveSshClientMock.mockReturnValueOnce(null);
+
+    await expect(resolveSshConfig({ user: "me", host: "alias", port: 22 })).resolves.toBeNull();
+    expect(runCommandMock).not.toHaveBeenCalled();
   });
 });

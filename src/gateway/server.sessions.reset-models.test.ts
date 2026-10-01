@@ -4,98 +4,37 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { expect, test } from "vitest";
+import { formatSqliteSessionFileMarker } from "../config/sessions/legacy-sqlite-marker.js";
 import { loadSessionEntry, replaceSessionEntry } from "../config/sessions/session-accessor.js";
-import { formatSqliteSessionFileMarker } from "../config/sessions/sqlite-marker.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { MODEL_SELECTION_LOCKED_RESET_MESSAGE } from "../sessions/model-overrides.js";
 import { listSessionStateEventsSince } from "../sessions/session-state-events.js";
+import { ensureProfileForEmail, setUserProfileRole } from "../state/user-profiles.js";
 import { normalizeSessionDeliveryState } from "../utils/delivery-context.shared.js";
+import { createSessionMutationTestClient } from "./server-methods/sessions-mutations.owner.test-support.js";
 import { testState, writeSessionStore } from "./test-helpers.js";
 import {
-  setupGatewaySessionsTestHarness,
+  setupGatewaySessionsHandlerTestHarness,
   sessionStoreEntry,
   directSessionReq,
+  writeSingleLineSession,
 } from "./test/server-sessions.test-helpers.js";
 
-const { createSessionStoreDir } = setupGatewaySessionsTestHarness();
-
-type ResetSessionEntry = {
-  sessionId?: string;
-  sessionFile?: string;
-  chatType?: string;
-  delivery?: SessionEntry["delivery"];
-  groupId?: string;
-  subject?: string;
-  groupChannel?: string;
-  space?: string;
-  spawnedBy?: string;
-  spawnedWorkspaceDir?: string;
-  spawnedCwd?: string;
-  parentSessionKey?: string;
-  createdVia?: string;
-  createdActor?: { type: string; id?: string };
-  createdAt?: number;
-  forkSource?: { sessionKey: string; sessionId: string; entryId?: string };
-  previousSessionId?: string;
-  forkedFromParent?: boolean;
-  spawnDepth?: number;
-  subagentRole?: string;
-  subagentControlScope?: string;
-  elevatedLevel?: string;
-  ttsAuto?: string;
-  providerOverride?: string;
-  modelOverride?: string;
-  modelOverrideSource?: string;
-  authProfileOverride?: string;
-  modelProvider?: string;
-  model?: string;
-  authProfileOverrideSource?: string;
-  authProfileOverrideCompactionCount?: number;
-  fallbackNoticeSelectedModel?: string;
-  fallbackNoticeActiveModel?: string;
-  fallbackNoticeReason?: string;
-  sendPolicy?: string;
-  queueMode?: string;
-  queueDebounceMs?: number;
-  queueCap?: number;
-  queueDrop?: string;
-  groupActivation?: string;
-  groupActivationNeedsSystemIntro?: boolean;
-  execHost?: string;
-  execSecurity?: string;
-  execAsk?: string;
-  execNode?: string;
-  displayName?: string;
-  cliSessionBindings?: Record<
-    string,
-    {
-      sessionId?: string;
-      authProfileId?: string;
-      extraSystemPromptHash?: string;
-      mcpConfigHash?: string;
-    }
-  >;
-  cliSessionIds?: Record<string, string>;
-  claudeCliSessionId?: string;
-  label?: string;
-};
+const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 
 type ModelResetEntry = Pick<
-  ResetSessionEntry,
+  SessionEntry,
   "providerOverride" | "modelOverride" | "modelOverrideSource" | "modelProvider" | "model"
 >;
 type ResolvedSessionModel = { modelProvider: string; model: string };
-type SessionEntryOverrides = NonNullable<Parameters<typeof sessionStoreEntry>[1]>;
 
 test("sessions.reset stamps provenance when it materializes a missing row", async () => {
   await createSessionStoreDir();
-  const reset = await directSessionReq<{ entry: ResetSessionEntry }>(
+  const reset = await directSessionReq<{ entry: SessionEntry }>(
     "sessions.reset",
     { key: "agent:main:subagent:missing" },
     {
-      client: {
-        authenticatedUserProfile: { profileId: "profile-reset-creator" },
-      } as never,
+      client: createSessionMutationTestClient("profile-reset-creator"),
     },
   );
 
@@ -105,6 +44,7 @@ test("sessions.reset stamps provenance when it materializes a missing row", asyn
     createdActor: { type: "human", id: "profile-reset-creator" },
     createdAt: expect.any(Number),
   });
+  expect(reset.payload?.entry).not.toHaveProperty("sandbox");
   expect(
     listSessionStateEventsSince("agent:main:subagent:missing", "main", 0, 20).events,
   ).toContainEqual(
@@ -114,6 +54,48 @@ test("sessions.reset stamps provenance when it materializes a missing row", asyn
       actorId: "profile-reset-creator",
     }),
   );
+});
+
+test("sessions.reset stamps the creator's required sandbox only when materializing a new row", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const profile = ensureProfileForEmail("sandboxed-reset-creator@example.test");
+  setUserProfileRole(profile.id, "guest");
+  const { writeConfigFile } = await import("../config/config.js");
+  await writeConfigFile({
+    gateway: {
+      roles: {
+        default: "guest",
+        definitions: {
+          guest: {
+            sessions: { others: "none" },
+            agents: ["main"],
+            scopes: ["operator.read", "operator.write"],
+            sandbox: "required",
+          },
+        },
+      },
+    },
+  });
+
+  try {
+    const key = "agent:main:subagent:sandboxed-reset";
+    const reset = await directSessionReq<{ entry: SessionEntry }>(
+      "sessions.reset",
+      { key },
+      {
+        client: createSessionMutationTestClient(profile.id),
+      },
+    );
+
+    expect(reset.ok, JSON.stringify(reset.error)).toBe(true);
+    expect(reset.payload?.entry).toMatchObject({
+      createdActor: { type: "human", id: profile.id },
+      sandbox: "required",
+    });
+    expect(loadSessionEntry({ sessionKey: key, storePath })?.sandbox).toBe("required");
+  } finally {
+    await writeConfigFile({});
+  }
 });
 
 const ownedChildMetadata = {
@@ -132,10 +114,16 @@ const ownedChildMetadata = {
   groupChannel: "dev",
   space: "hq",
   spawnedBy: "agent:main:main",
+  completionOwnerSessionKey: "agent:main:discord:direct:alice",
+  inheritedToolPolicyVersion: 1,
+  inheritedToolAllow: ["read", "message"],
+  inheritedToolDeny: ["exec"],
   spawnedWorkspaceDir: "/tmp/child-workspace",
   spawnedCwd: "/tmp/task-repo",
   parentSessionKey: "agent:main:main",
+  parentSessionId: "sess-parent",
   forkedFromParent: true,
+  sandbox: "required",
   spawnDepth: 2,
   subagentRole: "orchestrator",
   subagentControlScope: "children",
@@ -155,8 +143,6 @@ const ownedChildMetadata = {
   groupActivation: "always",
   groupActivationNeedsSystemIntro: true,
   execHost: "gateway",
-  execSecurity: "allowlist",
-  execAsk: "on-miss",
   execNode: "mac-mini",
   displayName: "Ops Child",
   cliSessionIds: {
@@ -171,14 +157,11 @@ const ownedChildMetadata = {
   },
   claudeCliSessionId: "cli-session-123",
   label: "owned child",
-} satisfies SessionEntryOverrides & ResetSessionEntry;
+  autoLabel: "Device",
+} satisfies Partial<SessionEntry>;
 
-function expectSqliteSessionFile(entry: ResetSessionEntry | undefined) {
-  expect(entry?.sessionFile).toContain(`sqlite:main:${entry?.sessionId}:`);
-}
-
-function expectOwnedChildMetadata(entry: ResetSessionEntry | undefined) {
-  expectSqliteSessionFile(entry);
+function expectOwnedChildMetadata(entry: SessionEntry | undefined) {
+  expect(entry).not.toHaveProperty("sessionFile");
   expect(entry).toMatchObject({
     ...ownedChildMetadata,
   });
@@ -187,7 +170,7 @@ function expectOwnedChildMetadata(entry: ResetSessionEntry | undefined) {
 async function expectMainResetModelFields(params: {
   defaultPrimary: string;
   sessionId: string;
-  entry: SessionEntryOverrides & ModelResetEntry;
+  entry: Partial<SessionEntry>;
   expected: ModelResetEntry;
   expectedResolved: ResolvedSessionModel;
 }) {
@@ -222,9 +205,7 @@ async function expectMainResetModelFields(params: {
   expect(reset.payload?.entry.modelProvider).toBe(params.expectedResolved.modelProvider);
   expect(reset.payload?.entry.model).toBe(params.expectedResolved.model);
 
-  const stored = loadSessionEntry({ sessionKey: "agent:main:main", storePath }) as
-    | ModelResetEntry
-    | undefined;
+  const stored = loadSessionEntry({ sessionKey: "agent:main:main", storePath });
   for (const key of selectionKeys) {
     expect(stored?.[key]).toBe(params.expected[key]);
   }
@@ -291,10 +272,7 @@ test("sessions.reset recomputes model from defaults instead of stale runtime mod
   expect(reset.ok).toBe(true);
   expect(reset.payload?.key).toBe("agent:main:main");
   expect(reset.payload?.entry.sessionId).toBe("sess-stale-model");
-  const sessionFile = reset.payload?.entry.sessionFile;
-  if (!sessionFile) {
-    throw new Error("expected reset session file");
-  }
+  expect(reset.payload?.entry).not.toHaveProperty("sessionFile");
   expect(reset.payload?.resolved).toEqual({
     modelProvider: "openai",
     model: "gpt-test-a",
@@ -302,7 +280,59 @@ test("sessions.reset recomputes model from defaults instead of stale runtime mod
   expect(reset.payload?.entry.modelProvider).toBe("openai");
   expect(reset.payload?.entry.model).toBe("gpt-test-a");
   expect(reset.payload?.entry.contextTokens).toBeUndefined();
-  expect(sessionFile).toContain(`sqlite:main:${reset.payload?.entry.sessionId}:`);
+});
+
+test("sessions.reset retains sandbox choice but requires fresh native runtime consent", async () => {
+  const { storePath } = await createSessionStoreDir();
+  await writeSessionStore({
+    entries: {
+      main: sessionStoreEntry("sandbox-opt-out", {
+        sandboxMode: "off",
+        nativeRuntimeConsent: "native-fixture",
+      }),
+    },
+  });
+  const reset = await directSessionReq<{ entry: SessionEntry }>("sessions.reset", {
+    key: "main",
+  });
+  expect(reset.ok).toBe(true);
+  expect(reset.payload?.entry.sandboxMode).toBe("off");
+  expect(loadSessionEntry({ sessionKey: "agent:main:main", storePath })?.sandboxMode).toBe("off");
+  expect(reset.payload?.entry.nativeRuntimeConsent).toBeUndefined();
+  expect(loadSessionEntry({ sessionKey: "agent:main:main", storePath })).not.toHaveProperty(
+    "nativeRuntimeConsent",
+  );
+});
+test("sessions.reset preserves the selected runtime and retires native conversation bindings", async () => {
+  const { dir, storePath } = await createSessionStoreDir();
+  await writeSingleLineSession(dir, "sess-main", "old conversation");
+  await writeSessionStore({
+    entries: {
+      main: {
+        ...sessionStoreEntry("sess-main"),
+        lifecycleRevision: "old-lifecycle",
+        providerOverride: "provider-a",
+        modelOverride: "opaque/model",
+        modelOverrideSource: "user",
+        agentRuntimeOverride: "native-runtime",
+        agentHarnessId: "previous-runtime",
+        cliSessionIds: { "previous-runtime": "old-native-session" },
+      },
+    },
+  });
+  const response = await directSessionReq("sessions.reset", { key: "main" });
+  expect(response.ok).toBe(true);
+  const entry = loadSessionEntry({ agentId: "main", sessionKey: "agent:main:main", storePath });
+  expect(entry).toMatchObject({
+    sessionId: "sess-main",
+    providerOverride: "provider-a",
+    modelOverride: "opaque/model",
+    modelOverrideSource: "user",
+    agentRuntimeOverride: "native-runtime",
+  });
+  expect(entry?.lifecycleRevision).not.toBe("old-lifecycle");
+  expect(entry?.agentHarnessId).toBeUndefined();
+  expect(entry?.cliSessionIds).toBeUndefined();
 });
 
 test("sessions.reset clears stale estimated context budget status", async () => {
@@ -357,9 +387,7 @@ test("sessions.reset clears stale estimated context budget status", async () => 
   expect(reset.payload?.entry.contextBudgetStatus).toBeUndefined();
   expect(reset.payload?.entry.contextTokens).toBeUndefined();
 
-  const stored = loadSessionEntry({ sessionKey: "agent:main:main", storePath }) as
-    | { contextBudgetStatus?: unknown; contextTokens?: number }
-    | undefined;
+  const stored = loadSessionEntry({ sessionKey: "agent:main:main", storePath });
   expect(stored?.contextBudgetStatus).toBeUndefined();
   expect(stored?.contextTokens).toBeUndefined();
 });
@@ -397,97 +425,52 @@ test("sessions.reset drops cached skills snapshot so /new rebuilds visible skill
   expect(reset.payload?.entry.sessionId).toBe("sess-stale-skills");
   expect(reset.payload?.entry.skillsSnapshot).toBeUndefined();
 
-  const stored = loadSessionEntry({ sessionKey: "agent:main:main", storePath }) as
-    | { skillsSnapshot?: unknown }
-    | undefined;
+  const stored = loadSessionEntry({ sessionKey: "agent:main:main", storePath });
   expect(stored?.skillsSnapshot).toBeUndefined();
 });
 
-test("sessions.reset rotates generated topic transcript files with the new session id", async () => {
-  const { dir, storePath } = await createSessionStoreDir();
-  const previousSessionId = "11111111-1111-4111-8111-111111111111";
-  const previousSessionFile = path.join(dir, `${previousSessionId}-topic-456.jsonl`);
-  await fs.writeFile(previousSessionFile, `${JSON.stringify({ role: "user", content: "old" })}\n`);
-
-  await writeSessionStore({
-    entries: {
-      "agent:main:telegram:group:123:topic:456": sessionStoreEntry(previousSessionId, {
-        sessionFile: previousSessionFile,
-      }),
-    },
-  });
-
-  const reset = await directSessionReq<{
-    ok: true;
-    key: string;
-    entry: {
-      sessionId: string;
-      sessionFile?: string;
-    };
-  }>("sessions.reset", {
+test.each([
+  {
+    locator: "a generated topic",
     key: "agent:main:telegram:group:123:topic:456",
-  });
-
-  expect(reset.ok).toBe(true);
-  const nextSessionId = reset.payload?.entry.sessionId;
-  const nextSessionFile = reset.payload?.entry.sessionFile;
-  if (!nextSessionId || !nextSessionFile) {
-    throw new Error("expected reset session id and file");
-  }
-  expect(nextSessionId).toBe(previousSessionId);
-  expect(nextSessionFile).toContain(`sqlite:main:${nextSessionId}:`);
-
-  const persistedEntry = loadSessionEntry({
     sessionKey: "agent:main:telegram:group:123:topic:456",
-    storePath,
-  });
-  expect(persistedEntry?.sessionId).toBe(nextSessionId);
-  expect(persistedEntry?.sessionFile).toBe(nextSessionFile);
-});
+    sessionId: "11111111-1111-4111-8111-111111111111",
+    filename: "11111111-1111-4111-8111-111111111111-topic-456.jsonl",
+  },
+  {
+    locator: "an already-stale generated",
+    key: "main",
+    sessionKey: "agent:main:main",
+    sessionId: "22222222-2222-4222-8222-222222222222",
+    // Upgraded stores can retain a locator for an older session ID (#77770).
+    filename: "11111111-1111-4111-8111-111111111111.jsonl",
+  },
+])(
+  "sessions.reset drops $locator transcript locator",
+  async ({ key, sessionKey, sessionId, filename }) => {
+    const { dir, storePath } = await createSessionStoreDir();
+    const sessionFile = path.join(dir, filename);
+    await fs.writeFile(sessionFile, `${JSON.stringify({ role: "user", content: "old" })}\n`);
 
-test("sessions.reset rotates an already-stale generated transcript file to the new session id", async () => {
-  const { dir, storePath } = await createSessionStoreDir();
-  // Post-upgrade state: the stored sessionFile still embeds an OLDER generated id
-  // that no longer matches the entry's logical sessionId, so rotation must key off
-  // the file's embedded id rather than the current sessionId (issue #77770).
-  const staleFileSessionId = "11111111-1111-4111-8111-111111111111";
-  const currentSessionId = "22222222-2222-4222-8222-222222222222";
-  const staleSessionFile = path.join(dir, `${staleFileSessionId}.jsonl`);
-  await fs.writeFile(staleSessionFile, `${JSON.stringify({ role: "user", content: "old" })}\n`);
+    await writeSessionStore({
+      entries: {
+        [key]: sessionStoreEntry(sessionId, { sessionFile }),
+      },
+    });
 
-  await writeSessionStore({
-    entries: {
-      main: sessionStoreEntry(currentSessionId, {
-        sessionFile: staleSessionFile,
-      }),
-    },
-  });
+    const reset = await directSessionReq<{ entry: SessionEntry }>("sessions.reset", { key });
 
-  const reset = await directSessionReq<{
-    ok: true;
-    key: string;
-    entry: {
-      sessionId: string;
-      sessionFile?: string;
-    };
-  }>("sessions.reset", { key: "main" });
+    expect(reset.ok).toBe(true);
+    expect(reset.payload?.entry.sessionId).toBe(sessionId);
+    expect(reset.payload?.entry).not.toHaveProperty("sessionFile");
 
-  expect(reset.ok).toBe(true);
-  const nextSessionId = reset.payload?.entry.sessionId;
-  const nextSessionFile = reset.payload?.entry.sessionFile;
-  if (!nextSessionId || !nextSessionFile) {
-    throw new Error("expected reset session id and file");
-  }
-  expect(nextSessionId).toBe(currentSessionId);
-  expect(nextSessionFile).toContain(`sqlite:main:${nextSessionId}:`);
-  expect(nextSessionFile).not.toContain(staleFileSessionId);
+    const persistedEntry = loadSessionEntry({ sessionKey, storePath });
+    expect(persistedEntry?.sessionId).toBe(sessionId);
+    expect(persistedEntry).not.toHaveProperty("sessionFile");
+  },
+);
 
-  const persistedEntry = loadSessionEntry({ sessionKey: "agent:main:main", storePath });
-  expect(persistedEntry?.sessionId).toBe(nextSessionId);
-  expect(persistedEntry?.sessionFile).toBe(nextSessionFile);
-});
-
-test("sessions.reset replaces a SQLite marker for a different transcript target", async () => {
+test("sessions.reset drops a stale SQLite marker", async () => {
   const { storePath } = await createSessionStoreDir();
   const sessionId = "current-session";
   const sessionKey = "agent:main:main";
@@ -521,10 +504,7 @@ test("sessions.reset replaces a SQLite marker for a different transcript target"
 
   expect(reset.ok).toBe(true);
   expect(reset.payload?.entry.sessionId).toBe(sessionId);
-  expect(reset.payload?.entry.sessionFile).toBe(
-    formatSqliteSessionFileMarker({ agentId: "main", sessionId, storePath }),
-  );
-  expect(reset.payload?.entry.sessionFile).not.toBe(staleMarker);
+  expect(reset.payload?.entry).not.toHaveProperty("sessionFile");
 });
 
 test("sessions.reset preserves legacy explicit model overrides without modelOverrideSource", async () => {
@@ -554,9 +534,12 @@ test("sessions.reset clears fallback-pinned model overrides and restores the sel
       providerOverride: "anthropic",
       modelOverride: "claude-opus-4-1",
       modelOverrideSource: "auto",
-      fallbackNoticeSelectedModel: "openai/gpt-test-a",
-      fallbackNoticeActiveModel: "anthropic/claude-opus-4-1",
-      fallbackNoticeReason: "rate limit",
+      fallbackNotice: {
+        kind: "active",
+        selectedModel: "openai/gpt-test-a",
+        activeModel: "anthropic/claude-opus-4-1",
+        reason: "rate limit",
+      },
     },
     expected: {
       providerOverride: undefined,
@@ -574,9 +557,12 @@ test("sessions.reset follows the updated default after an auto fallback pinned a
       providerOverride: "anthropic",
       modelOverride: "claude-opus-4-1",
       modelOverrideSource: "auto",
-      fallbackNoticeSelectedModel: "openai/gpt-test-a",
-      fallbackNoticeActiveModel: "anthropic/claude-opus-4-1",
-      fallbackNoticeReason: "rate limit",
+      fallbackNotice: {
+        kind: "active",
+        selectedModel: "openai/gpt-test-a",
+        activeModel: "anthropic/claude-opus-4-1",
+        reason: "rate limit",
+      },
     },
     expected: {
       providerOverride: undefined,
@@ -601,6 +587,7 @@ test("sessions.reset preserves spawned session ownership metadata", async () => 
         createdVia: "spawn",
         createdActor: { type: "agent", id: "agent:main:main" },
         createdAt: 1_000,
+        inheritedGitContributorProfileIds: ["original-contributor"],
         forkSource: {
           sessionKey: "agent:main:root",
           sessionId: "root-session",
@@ -613,11 +600,12 @@ test("sessions.reset preserves spawned session ownership metadata", async () => 
   const reset = await directSessionReq<{
     ok: true;
     key: string;
-    entry: ResetSessionEntry;
+    entry: SessionEntry;
   }>("sessions.reset", { key: "subagent:child" });
 
   expect(reset.ok).toBe(true);
   expectOwnedChildMetadata(reset.payload?.entry);
+  expect(reset.payload?.entry).not.toHaveProperty("inheritedGitContributorProfileIds");
   expect(reset.payload?.entry).toMatchObject({
     createdVia: "spawn",
     createdActor: { type: "agent", id: "agent:main:main" },
@@ -629,14 +617,13 @@ test("sessions.reset preserves spawned session ownership metadata", async () => 
     },
   });
 
-  const stored = loadSessionEntry({ sessionKey: "agent:main:subagent:child", storePath }) as
-    | ResetSessionEntry
-    | undefined;
+  const stored = loadSessionEntry({ sessionKey: "agent:main:subagent:child", storePath });
   expectOwnedChildMetadata(stored);
   expect(stored).toMatchObject({
     createdVia: "spawn",
     createdActor: { type: "agent", id: "agent:main:main" },
     createdAt: 1_000,
+    inheritedGitContributorProfileIds: ["original-contributor"],
     forkSource: {
       sessionKey: "agent:main:root",
       sessionId: "root-session",

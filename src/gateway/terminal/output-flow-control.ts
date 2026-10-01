@@ -66,6 +66,11 @@ export class TerminalOutputController {
     this.lastInputAtMs = this.now();
   }
 
+  /** Reassesses flow control immediately when the live recipient set changes. */
+  reconcileRecipients(): void {
+    this.reconcile(this.getConnIds());
+  }
+
   /** Flushes existing viewers, then aligns live frames after the attach snapshot. */
   prepareViewerAttach(): void {
     this.coalescer.flush();
@@ -80,7 +85,7 @@ export class TerminalOutputController {
     this.lastInputAtMs = Number.NEGATIVE_INFINITY;
     if (this.reassertTimer) {
       this.desiredPaused = false;
-      this.tryResume();
+      this.applyFlowControl();
     }
   }
 
@@ -90,7 +95,7 @@ export class TerminalOutputController {
       clearInterval(this.reassertTimer);
       this.reassertTimer = null;
       this.desiredPaused = false;
-      this.tryResume();
+      this.applyFlowControl();
     }
   }
 
@@ -113,13 +118,13 @@ export class TerminalOutputController {
       this.ensureReassertTimer();
       if (!this.desiredPaused) {
         this.desiredPaused = true;
-        this.tryPause();
+        this.applyFlowControl();
       }
       return;
     }
     if (bufferedAmount <= TERMINAL_OUTPUT_LOW_WATER_BYTES && this.desiredPaused) {
       this.desiredPaused = false;
-      this.tryResume();
+      this.applyFlowControl();
     }
   }
 
@@ -139,11 +144,7 @@ export class TerminalOutputController {
         this.desiredPaused = false;
       }
       // Reassert both states. A missed native resume must not wedge the shell.
-      if (this.desiredPaused) {
-        this.tryPause();
-      } else {
-        this.tryResume();
-      }
+      this.applyFlowControl();
     }, TERMINAL_OUTPUT_REASSERT_MS);
     this.reassertTimer.unref?.();
   }
@@ -159,19 +160,11 @@ export class TerminalOutputController {
     return maximum;
   }
 
-  private tryPause(): void {
+  private applyFlowControl(): void {
     try {
-      this.backend.pause();
+      this.backend[this.desiredPaused ? "pause" : "resume"]();
     } catch {
-      // The failsafe timer retries while pressure remains high.
-    }
-  }
-
-  private tryResume(): void {
-    try {
-      this.backend.resume();
-    } catch {
-      // The failsafe timer retries after a prior pause.
+      // The failsafe timer reasserts the desired state after native failures.
     }
   }
 }

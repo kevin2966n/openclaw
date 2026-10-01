@@ -1,29 +1,15 @@
 // Discord tests cover client plugin behavior.
 import { ApplicationCommandType, ComponentType, Routes } from "discord-api-types/v10";
-import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client } from "./client.js";
-import { BaseCommand } from "./commands.js";
+import { Command, type CommandOptions, type DiscordCommand } from "./commands.js";
 import { ComponentRegistry } from "./component-registry.js";
 import { Button, StringSelectMenu, parseCustomId } from "./components.js";
 import { DiscordError } from "./rest.js";
 import { attachRestMock, createInternalTestClient } from "./test-builders.test-support.js";
 
 type AnyListener = Parameters<Client["registerListener"]>[0];
-
-function createDeferred<T = void>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve: (value: T | PromiseLike<T>) => void = () => {};
-  let reject: (reason?: unknown) => void = () => {};
-  const promise = new Promise<T>((promiseResolve, promiseReject) => {
-    resolve = promiseResolve;
-    reject = promiseReject;
-  });
-  return { promise, resolve, reject };
-}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -33,16 +19,14 @@ afterEach(() => {
 function createTestCommand(params: {
   name: string;
   guildIds?: string[];
-  options?: unknown[];
-}): BaseCommand {
-  return new (class extends BaseCommand {
+  options?: CommandOptions;
+}): DiscordCommand {
+  return new (class extends Command {
     name = params.name;
     override description = `${params.name} command`;
-    type = ApplicationCommandType.ChatInput;
     override guildIds = params.guildIds;
-    serializeOptions() {
-      return params.options;
-    }
+    override options = params.options;
+    run() {}
   })();
 }
 
@@ -105,19 +89,6 @@ describe("ComponentRegistry", () => {
       button,
     );
   });
-
-  it("caps oversized one-off component wait timers", () => {
-    vi.useFakeTimers();
-    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-    const registry = new ComponentRegistry<Button>();
-
-    void registry.waitForMessageComponent(
-      { id: "message-1", channelId: "channel-1" } as never,
-      Number.MAX_SAFE_INTEGER,
-    );
-
-    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), MAX_TIMER_TIMEOUT_MS);
-  });
 });
 
 describe("Client.deployCommands", () => {
@@ -154,38 +125,6 @@ describe("Client.deployCommands", () => {
     expect(put).toHaveBeenCalledTimes(2);
   });
 
-  it("does not patch semantically unchanged nested command options", async () => {
-    const client = createInternalTestClient([
-      createTestCommand({
-        name: "one",
-        options: [{ type: 3, name: "value", description: "Value" }],
-      }),
-    ]);
-    const get = vi.fn(async () => [
-      {
-        id: "cmd1",
-        application_id: "app1",
-        type: ApplicationCommandType.ChatInput,
-        name: "one",
-        description: "one command",
-        options: [{ description: "Value", name: "value", type: 3 }],
-        default_member_permissions: null,
-        integration_types: [0, 1],
-        contexts: [0, 1, 2],
-      },
-    ]);
-    const patch = vi.fn(async () => undefined);
-    const post = vi.fn(async () => undefined);
-    const deleteRequest = vi.fn(async () => undefined);
-    attachRestMock(client, { get, patch, post, delete: deleteRequest });
-
-    await client.deployCommands({ mode: "reconcile" });
-
-    expect(patch).not.toHaveBeenCalled();
-    expect(post).not.toHaveBeenCalled();
-    expect(deleteRequest).not.toHaveBeenCalled();
-  });
-
   it("does not patch live-only command metadata or reordered unordered arrays", async () => {
     const client = createInternalTestClient([
       createTestCommand({
@@ -213,9 +152,9 @@ describe("Client.deployCommands", () => {
         description_localized: "one command",
         options: [
           {
-            type: 3,
-            name: "value",
             description: "Value",
+            name: "value",
+            type: 3,
             description_localized: "Value",
             channel_types: [0, 1],
           },
@@ -483,9 +422,7 @@ describe("Client gateway event queue", () => {
   }): Client {
     return new Client(
       {
-        baseUrl: "http://localhost",
         clientId: "app1",
-        publicKey: "public",
         token: "token",
         eventQueue: params.eventQueue,
       },
@@ -543,7 +480,7 @@ describe("Client gateway event queue", () => {
   it("holds a timed-out listener slot until its underlying promise resolves", async () => {
     vi.useFakeTimers();
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const firstSettlement = createDeferred();
+    const firstSettlement = createDeferred<void>();
     const started: string[] = [];
     const first = {
       type: "READY",
@@ -593,7 +530,7 @@ describe("Client gateway event queue", () => {
   it("logs a listener failure that arrives after its dispatch timeout", async () => {
     vi.useFakeTimers();
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const settlement = createDeferred();
+    const settlement = createDeferred<void>();
     const lateError = new Error("late listener failure");
     const listener = {
       type: "READY",
@@ -629,8 +566,8 @@ describe("Client gateway event queue", () => {
 
   it("limits queued listener concurrency", async () => {
     const started: string[] = [];
-    const releaseFirst = createDeferred();
-    const releaseSecond = createDeferred();
+    const releaseFirst = createDeferred<void>();
+    const releaseSecond = createDeferred<void>();
     const first = {
       type: "READY",
       handle: vi.fn(async () => {

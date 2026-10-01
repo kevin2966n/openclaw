@@ -1,5 +1,4 @@
-// Gateway Client module implements timeouts behavior.
-function parseStrictPositiveInteger(value: string): number | undefined {
+function parsePositiveTimeoutSetting(value: string): number | undefined {
   const trimmed = value.trim();
   if (!/^\+?\d+$/u.test(trimmed)) {
     return undefined;
@@ -15,12 +14,7 @@ function isTestRuntimeEnv(env: NodeJS.ProcessEnv): boolean {
     env.VITEST_POOL_ID !== undefined ||
     env.VITEST_WORKER_ID !== undefined ||
     env.NODE_ENV === "test" ||
-    (env !== process.env &&
-      (process.env.VITEST === "true" ||
-        process.env.VITEST === "1" ||
-        process.env.VITEST_POOL_ID !== undefined ||
-        process.env.VITEST_WORKER_ID !== undefined ||
-        process.env.NODE_ENV === "test"))
+    (env !== process.env && isTestRuntimeEnv(process.env))
   );
 }
 
@@ -28,6 +22,22 @@ function isTestRuntimeEnv(env: NodeJS.ProcessEnv): boolean {
 export const MAX_SAFE_TIMEOUT_DELAY_MS = 2_147_483_647;
 /** Default server-side window for gateway preauth handshakes. */
 export const DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/** Starts the browser-safe deadline that covers Gateway connect preparation and hello. */
+export function startGatewayConnectTimeout(onTimeout: () => void): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(onTimeout, DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS);
+  timer.unref?.();
+  return timer;
+}
+
+/** Clears either pending Gateway handshake phase without retaining its timer. */
+export function clearGatewayConnectTimeout(timer: ReturnType<typeof setTimeout> | null): null {
+  if (timer !== null) {
+    clearTimeout(timer);
+  }
+  return null;
+}
+
 /** Default deadline for a single non-streaming Gateway request. */
 export const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000;
 /** Minimum client watchdog delay for connect challenge setup. */
@@ -90,7 +100,7 @@ export function getConnectChallengeTimeoutMsFromEnv(
 ): number | undefined {
   const raw = env.OPENCLAW_CONNECT_CHALLENGE_TIMEOUT_MS;
   if (raw) {
-    const parsed = parseStrictPositiveInteger(raw);
+    const parsed = parsePositiveTimeoutSetting(raw);
     if (parsed !== undefined) {
       return resolveSafeTimeoutDelayMs(parsed);
     }
@@ -139,7 +149,7 @@ export function resolvePreauthHandshakeTimeoutMs(params?: {
     env.OPENCLAW_HANDSHAKE_TIMEOUT_MS ||
     (isTestRuntimeEnv(env) ? env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS : undefined);
   if (configuredTimeout) {
-    const parsed = parseStrictPositiveInteger(configuredTimeout);
+    const parsed = parsePositiveTimeoutSetting(configuredTimeout);
     if (parsed !== undefined) {
       return resolveSafeTimeoutDelayMs(parsed);
     }

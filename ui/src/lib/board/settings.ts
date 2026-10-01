@@ -1,36 +1,31 @@
-export type BoardFace = "chat" | "dashboard";
-export type BoardVisibleChatDock = "bottom" | "left" | "right";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import type { SessionBoardFace } from "../../../../src/shared/session-types.js";
+import type { BoardTab } from "./types.ts";
+
+export type BoardFace = SessionBoardFace;
+type BoardVisibleChatDock = Exclude<BoardTab["chatDock"], "hidden">;
 
 export type BoardSessionView = {
-  face: BoardFace;
   activeTabId?: string;
   reopenDockByTab?: Record<string, BoardVisibleChatDock>;
 };
 
 export type BoardSessionViews = Record<string, BoardSessionView>;
 
-const MAX_BOARD_SESSION_VIEWS = 50;
+const MAX_BOARD_SESSION_VIEWS = 500;
 
 export function normalizeBoardSessionViews(value: unknown): BoardSessionViews {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     return {};
   }
   const normalized: BoardSessionViews = {};
-  for (const [sessionKey, rawView] of Object.entries(value)) {
-    if (!sessionKey.trim() || !rawView || typeof rawView !== "object" || Array.isArray(rawView)) {
-      continue;
-    }
-    const view = rawView as Record<string, unknown>;
-    if (view.face !== "chat" && view.face !== "dashboard") {
+  for (const [sessionKey, view] of Object.entries(value)) {
+    if (!sessionKey.trim() || !isRecord(view)) {
       continue;
     }
     const activeTabId = typeof view.activeTabId === "string" ? view.activeTabId.trim() : "";
     const reopenDockByTab: Record<string, BoardVisibleChatDock> = {};
-    if (
-      view.reopenDockByTab &&
-      typeof view.reopenDockByTab === "object" &&
-      !Array.isArray(view.reopenDockByTab)
-    ) {
+    if (isRecord(view.reopenDockByTab)) {
       for (const [tabId, dock] of Object.entries(view.reopenDockByTab).slice(0, 50)) {
         const key = tabId.trim();
         if (key && (dock === "bottom" || dock === "left" || dock === "right")) {
@@ -38,8 +33,10 @@ export function normalizeBoardSessionViews(value: unknown): BoardSessionViews {
         }
       }
     }
+    if (!activeTabId && Object.keys(reopenDockByTab).length === 0) {
+      continue;
+    }
     normalized[sessionKey] = {
-      face: view.face,
       ...(activeTabId ? { activeTabId } : {}),
       ...(Object.keys(reopenDockByTab).length > 0 ? { reopenDockByTab } : {}),
     };
@@ -57,7 +54,7 @@ export function updateBoardSessionView(
     return normalizeBoardSessionViews(current);
   }
   const views = normalizeBoardSessionViews(current);
-  const previous = views[key] ?? { face: "chat" as const };
+  const previous = views[key] ?? {};
   delete views[key];
   views[key] = {
     ...previous,

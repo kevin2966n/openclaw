@@ -1,4 +1,3 @@
-// Presents plugin approvals that belong to the active TUI session.
 import {
   SelectList,
   Text,
@@ -6,11 +5,14 @@ import {
   type OverlayHandle,
   type SelectItem,
 } from "@earendil-works/pi-tui";
+import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { isApprovalStaleError } from "../infra/approval-errors.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import { selectListTheme, theme } from "./theme/theme.js";
+import { createTuiRefreshCoalescer } from "./coalesced-refresh.js";
+import { selectListTheme, tuiTheme as theme } from "./theme/theme.js";
 import type { TuiApprovalDecision, TuiBackend, TuiPluginApproval } from "./tui-backend.js";
 import { sanitizeRenderableText } from "./tui-formatters.js";
+import { matchesOwnedTuiSession } from "./tui-session-events.js";
 
 type ApprovalSelector = Component & {
   onSelect?: (item: SelectItem) => void;
@@ -126,10 +128,6 @@ const DECISION_ITEMS: Record<TuiApprovalDecision, SelectItem> = {
   },
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
 function parseDecision(value: unknown): TuiApprovalDecision | null {
   return value === "allow-once" || value === "allow-always" || value === "deny" ? value : null;
 }
@@ -152,15 +150,16 @@ function parseSeverity(value: unknown): TuiPluginApproval["request"]["severity"]
   return value === "info" || value === "warning" || value === "critical" ? value : null;
 }
 
-/** Parses the gateway event/list shape used for pending plugin approvals. */
 function parseTuiPluginApproval(payload: unknown): TuiPluginApproval | null {
-  if (!isRecord(payload) || !isRecord(payload.request)) {
+  const record = asOptionalObjectRecord(payload);
+  const request = asOptionalObjectRecord(record?.request);
+  if (!record || !request) {
     return null;
   }
-  const id = typeof payload.id === "string" ? payload.id.trim() : "";
-  const title = typeof payload.request.title === "string" ? payload.request.title.trim() : "";
-  const createdAtMs = typeof payload.createdAtMs === "number" ? payload.createdAtMs : 0;
-  const expiresAtMs = typeof payload.expiresAtMs === "number" ? payload.expiresAtMs : 0;
+  const id = typeof record.id === "string" ? record.id.trim() : "";
+  const title = typeof request.title === "string" ? request.title.trim() : "";
+  const createdAtMs = typeof record.createdAtMs === "number" ? record.createdAtMs : 0;
+  const expiresAtMs = typeof record.expiresAtMs === "number" ? record.expiresAtMs : 0;
   if (!id || !title || !createdAtMs || !expiresAtMs) {
     return null;
   }
@@ -168,26 +167,17 @@ function parseTuiPluginApproval(payload: unknown): TuiPluginApproval | null {
     id,
     request: {
       title,
-      description:
-        typeof payload.request.description === "string" ? payload.request.description : null,
-      pluginId: typeof payload.request.pluginId === "string" ? payload.request.pluginId : null,
-      severity: parseSeverity(payload.request.severity),
-      toolName: typeof payload.request.toolName === "string" ? payload.request.toolName : null,
-      allowedDecisions: parseAllowedDecisions(payload.request.allowedDecisions),
-      agentId: typeof payload.request.agentId === "string" ? payload.request.agentId : null,
-      sessionKey:
-        typeof payload.request.sessionKey === "string" ? payload.request.sessionKey : null,
+      description: typeof request.description === "string" ? request.description : null,
+      pluginId: typeof request.pluginId === "string" ? request.pluginId : null,
+      severity: parseSeverity(request.severity),
+      toolName: typeof request.toolName === "string" ? request.toolName : null,
+      allowedDecisions: parseAllowedDecisions(request.allowedDecisions),
+      agentId: typeof request.agentId === "string" ? request.agentId : null,
+      sessionKey: typeof request.sessionKey === "string" ? request.sessionKey : null,
     },
     createdAtMs,
     expiresAtMs,
   };
-}
-
-function parseResolvedApprovalId(payload: unknown): string | null {
-  if (!isRecord(payload) || typeof payload.id !== "string") {
-    return null;
-  }
-  return payload.id.trim() || null;
 }
 
 function decisionLabel(decision: TuiApprovalDecision): string {
@@ -206,7 +196,6 @@ function approvalSurfaceLabel(approval: TuiPluginApproval): string {
     : "plugin approval";
 }
 
-/** Coordinates pending plugin approval events with the active TUI overlay. */
 export function createTuiPluginApprovalController(deps: TuiPluginApprovalControllerDeps) {
   const createSelector =
     deps.createSelector ??
@@ -220,8 +209,7 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
   let expiryTimer: ApprovalTimer | null = null;
   let disposed = false;
   let mutationVersion = 0;
-  let refreshAgain = false;
-  let refreshInFlight: Promise<void> | null = null;
+  const refreshRunner = createTuiRefreshCoalescer(refreshOnce);
   const mutations = new Map<string, ApprovalMutation>();
   const resolvingIds = new Set<string>();
   const dismissedIds = new Set<string>();
@@ -234,6 +222,8 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
   };
 
   const closeActiveOverlay = () => {
+    clearExpiryTimer();
+    activeId = null;
     const handle = activeOverlay;
     activeOverlay = null;
     if (handle) {
@@ -242,7 +232,7 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
   };
 
   const recordMutation = (id: string, approval: TuiPluginApproval | null) => {
-    if (!refreshInFlight) {
+    if (!refreshRunner.isRunning()) {
       return;
     }
     mutationVersion += 1;
@@ -266,17 +256,8 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
     }
   };
 
-  const matchesActiveSession = (approval: TuiPluginApproval) => {
-    const sessionKey = approval.request.sessionKey?.trim();
-    if (!sessionKey || sessionKey !== deps.getSessionKey()) {
-      return false;
-    }
-    if (sessionKey !== "global") {
-      return true;
-    }
-    const agentId = approval.request.agentId?.trim();
-    return Boolean(agentId && agentId === deps.getAgentId());
-  };
+  const matchesActiveSession = (approval: TuiPluginApproval) =>
+    matchesOwnedTuiSession(deps.getSessionKey(), deps.getAgentId(), approval.request);
 
   const prune = () => {
     const now = nowMs();
@@ -325,8 +306,6 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
       if (activeId !== approval.id) {
         return;
       }
-      clearExpiryTimer();
-      activeId = null;
       resolvingIds.add(approval.id);
       closeActiveOverlay();
       deps.requestRender();
@@ -384,9 +363,7 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
         void resolve(deny);
         return;
       }
-      clearExpiryTimer();
       dismissedIds.add(approval.id);
-      activeId = null;
       closeActiveOverlay();
       deps.chatLog.addSystem(`${surfaceLabel}: dismissed; request remains pending`);
       presentNext();
@@ -398,7 +375,6 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
           return;
         }
         expiryTimer = null;
-        activeId = null;
         remove(approval.id);
         closeActiveOverlay();
         deps.chatLog.addSystem(`${surfaceLabel}: expired`);
@@ -437,7 +413,7 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
     queue = [...next.values()].toSorted((left, right) => left.createdAtMs - right.createdAtMs);
   };
 
-  const refreshOnce = async () => {
+  async function refreshOnce(): Promise<void> {
     if (disposed || !deps.client.listPluginApprovals) {
       return;
     }
@@ -455,33 +431,17 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
     }
     applySnapshot(approvals, startedAtVersion);
     if (activeId && !queue.some((approval) => approval.id === activeId)) {
-      clearExpiryTimer();
-      activeId = null;
       closeActiveOverlay();
     }
     presentNext();
     deps.requestRender();
-  };
+  }
 
   const refreshApprovals = async (): Promise<void> => {
     if (disposed || !deps.client.listPluginApprovals) {
       return;
     }
-    if (refreshInFlight) {
-      refreshAgain = true;
-      return await refreshInFlight;
-    }
-    refreshInFlight = (async () => {
-      do {
-        refreshAgain = false;
-        await refreshOnce();
-      } while (refreshAgain);
-    })();
-    try {
-      await refreshInFlight;
-    } finally {
-      refreshInFlight = null;
-    }
+    await refreshRunner.run();
   };
 
   return {
@@ -500,15 +460,14 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
       if (event !== "plugin.approval.resolved" && event !== "plugin.approval.removed") {
         return;
       }
-      const id = parseResolvedApprovalId(payload);
+      const value = asOptionalObjectRecord(payload)?.id;
+      const id = typeof value === "string" ? value.trim() : "";
       if (!id) {
         return;
       }
       remove(id);
       resolvingIds.delete(id);
       if (activeId === id) {
-        clearExpiryTimer();
-        activeId = null;
         closeActiveOverlay();
       }
       presentNext();
@@ -523,8 +482,6 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
         ? queue.find((approval) => approval.id === activeId)
         : undefined;
       if (activeApproval && !matchesActiveSession(activeApproval)) {
-        clearExpiryTimer();
-        activeId = null;
         closeActiveOverlay();
         deps.requestRender();
       }
@@ -541,7 +498,6 @@ export function createTuiPluginApprovalController(deps: TuiPluginApprovalControl
       mutations.clear();
       resolvingIds.clear();
       if (activeId) {
-        activeId = null;
         closeActiveOverlay();
         deps.requestRender();
       }

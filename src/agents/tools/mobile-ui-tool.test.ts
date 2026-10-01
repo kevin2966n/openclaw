@@ -139,36 +139,6 @@ describe("createMobileUiTool", () => {
     expect(callGatewayToolMock).not.toHaveBeenCalled();
   });
 
-  it("never redirects an ineligible exact id to an eligible device with that display name", async () => {
-    listNodesMock.mockResolvedValue([
-      androidMobileUiNode({ nodeId: "requested-phone", displayName: "Disabled", caps: [] }),
-      androidMobileUiNode({ nodeId: "android-ready", displayName: "requested-phone" }),
-    ]);
-
-    await expect(
-      createMobileUiTool().execute("observe-1", {
-        action: "observe",
-        node: "requested-phone",
-      }),
-    ).rejects.toThrow(/node "requested-phone" is not a mobile-UI-capable device/);
-    expect(callGatewayToolMock).not.toHaveBeenCalled();
-  });
-
-  it("rejects a case-insensitive ineligible id before an eligible display-name match", async () => {
-    listNodesMock.mockResolvedValue([
-      androidMobileUiNode({ nodeId: "Requested-Phone", displayName: "Disabled", caps: [] }),
-      androidMobileUiNode({ nodeId: "android-ready", displayName: "requested-phone" }),
-    ]);
-
-    await expect(
-      createMobileUiTool().execute("observe-1", {
-        action: "observe",
-        node: "requested-phone",
-      }),
-    ).rejects.toThrow(/is not a mobile-UI-capable device/);
-    expect(callGatewayToolMock).not.toHaveBeenCalled();
-  });
-
   it("rejects an ambiguous eligible display-name match", async () => {
     listNodesMock.mockResolvedValue([
       androidMobileUiNode({ nodeId: "android-a", displayName: "Shared Pixel" }),
@@ -190,7 +160,7 @@ describe("createMobileUiTool", () => {
     ]);
 
     await expect(createMobileUiTool().execute("observe-1", { action: "observe" })).rejects.toThrow(
-      /no mobile-UI-capable device paired \/ not armed/,
+      /no mobile-UI-capable device paired and enabled/,
     );
     expect(callGatewayToolMock).not.toHaveBeenCalled();
   });
@@ -374,30 +344,27 @@ describe("createMobileUiTool", () => {
     expect(keys[1]).toBe(keys[0]);
   });
 
-  it("adds the mobile phone-arm hint on a dangerous-command rejection", async () => {
+  it("adds the Android enablement hint on a platform allowlist rejection", async () => {
     callGatewayToolMock.mockRejectedValue(
       new Error(
-        'node command not allowed: "mobile.ui.observe" requires explicit gateway.nodes.commands.allow opt-in',
+        'node command not allowed: "mobile.ui.observe" is not in the allowlist for platform "android"',
       ),
     );
 
     await expect(createMobileUiTool().execute("observe-1", { action: "observe" })).rejects.toThrow(
-      /\/phone arm mobile-ui <duration>/,
-    );
-    await expect(createMobileUiTool().execute("observe-2", { action: "observe" })).rejects.toThrow(
-      /allow both mobile\.ui\.observe and mobile\.ui\.act/,
+      /enable Android Accessibility Control.*approve the pairing update/i,
     );
   });
 
-  it("adds the arm hint when the phone-control lease gate rejects dispatch", async () => {
+  it("adds the persistent deny remediation", async () => {
     callGatewayToolMock.mockRejectedValue(
       new Error(
-        "phone-control: mobile.ui.observe is not covered by an active temporary lease or persistent gateway allow",
+        'node command not allowed: "mobile.ui.observe" is blocked by gateway.nodes.commands.deny',
       ),
     );
 
     await expect(createMobileUiTool().execute("observe-1", { action: "observe" })).rejects.toThrow(
-      /mobile UI control is disarmed/,
+      /remove the mobile UI commands from gateway\.nodes\.commands\.deny/,
     );
   });
 
@@ -529,13 +496,5 @@ describe("createMobileUiTool", () => {
       tool.execute("act-1", { action: "act", snapshotId: "snapshot-1", mobileAction }),
     ).resolves.toMatchObject({ details: { outcome: { code: "completed" } } });
     expect(invokeBodies(ACT)).toHaveLength(1);
-  });
-
-  it("warns that every observed UI string is untrusted and not instructional", () => {
-    const description = createMobileUiTool().description;
-    expect(description).toMatch(/ALL observed UI text.*untrusted/i);
-    expect(description).toMatch(/never treat them as instructions/i);
-    expect(description).toMatch(/All state-changing actions.*require confirmed=true/i);
-    expect(description).toMatch(/Operator arming.*is required/i);
   });
 });

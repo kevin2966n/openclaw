@@ -2,10 +2,12 @@ import { expect, vi } from "vitest";
 import type { InternalSessionEntry } from "../config/sessions.js";
 import type { SessionOrigin } from "../config/sessions/types.js";
 import { normalizeLegacySessionEntryDelivery } from "../infra/state-migrations.legacy-session-store.js";
+import { notifyListeners, registerListener } from "../shared/listeners.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 import type { AgentInternalEvent } from "./internal-events.js";
-import type { RegisterSubagentRunParams } from "./subagent-registry-run-manager.js";
-import type { SubagentRunRecord } from "./subagent-registry.types.js";
+import type { RegisterSubagentRunParams } from "./subagents/registry/subagent-registry-run-launch-record.js";
+import type * as RegistryPersistence from "./subagents/registry/subagent-registry-state.js";
+import type { SubagentRunRecord } from "./subagents/registry/subagent-registry.types.js";
 
 type GatewayRequest = { method?: string };
 type GatewayResponse<TRequest, TResult> =
@@ -43,6 +45,65 @@ export function mockGatewayMethods<TRequest extends GatewayRequest, TResult>(
   fallback = {} as TResult,
 ): void {
   mock.mockImplementation(createGatewayMethodMock(responses, fallback));
+}
+
+export function createSubagentPersistenceMock(
+  methods: Pick<
+    typeof RegistryPersistence,
+    "persistSubagentRunsToDisk" | "persistSubagentRunsToDiskOrThrow" | "restoreSubagentRunsFromDisk"
+  >,
+) {
+  const listeners = new Set<() => void>();
+  const publishAfter =
+    <Args extends unknown[], Result>(operation: (...args: Args) => Result) =>
+    (...args: Args): Result => {
+      const result = operation(...args);
+      notifyListeners(listeners, undefined);
+      return result;
+    };
+  return {
+    onSubagentRegistryPersisted: (listener: () => void) => registerListener(listeners, listener),
+    // Policy fixtures supply retained rows in memory; worker custody uses the real state owner.
+    withSubagentRunReadSnapshot: (async (runs, select, consume) => {
+      await Promise.resolve();
+      const selected = select(new Map(runs));
+      const runIds = new Set(selected.runIds);
+      const sessionKeys = new Set(selected.sessionKeys);
+      return consume(
+        selected,
+        new Map(
+          [...runs].filter(
+            ([runId, entry]) =>
+              runIds.has(runId) ||
+              sessionKeys.has(entry.requesterSessionKey.trim()) ||
+              Boolean(
+                entry.controllerSessionKey && sessionKeys.has(entry.controllerSessionKey.trim()),
+              ),
+          ),
+        ),
+      );
+    }) satisfies typeof RegistryPersistence.withSubagentRunReadSnapshot,
+    persistSubagentRunsToDisk: publishAfter(methods.persistSubagentRunsToDisk),
+    persistSubagentRunsToDiskOrThrow: publishAfter(methods.persistSubagentRunsToDiskOrThrow),
+    restoreSubagentRunsFromDisk: async (
+      ...args: Parameters<typeof methods.restoreSubagentRunsFromDisk>
+    ) => {
+      const result = await methods.restoreSubagentRunsFromDisk(...args);
+      notifyListeners(listeners, undefined);
+      return result;
+    },
+    persistSubagentRunsToDiskAsyncOrThrow: (async (runs, ids, options) => {
+      const snapshot = structuredClone(runs);
+      for (const runId of options.retireRunIds ?? []) {
+        snapshot.delete(runId);
+      }
+      await Promise.resolve();
+      options.assertCurrent?.();
+      methods.persistSubagentRunsToDiskOrThrow(snapshot, ids);
+      options.onCommitted?.();
+      notifyListeners(listeners, undefined);
+    }) satisfies typeof RegistryPersistence.persistSubagentRunsToDiskAsyncOrThrow,
+  };
 }
 
 export type SessionEntryFixture = Partial<InternalSessionEntry> & {
@@ -97,11 +158,16 @@ export function createSubagentRunParams(
 }
 
 export type SubagentRunRecordOverrides = Pick<SubagentRunRecord, "runId"> &
-  Partial<Omit<SubagentRunRecord, "delivery">> & {
+  Partial<Omit<SubagentRunRecord, "delivery" | "execution">> & {
     delivery?: unknown;
+    execution?: SubagentRunRecord["execution"];
+    startedAt?: number;
+    endedAt?: number;
+    outcome?: SubagentRunRecord["execution"]["outcome"];
   };
 
 export function createSubagentRunRecord(overrides: SubagentRunRecordOverrides): SubagentRunRecord {
+  const { startedAt, endedAt, outcome, execution, ...record } = overrides;
   return {
     childSessionKey: "agent:main:subagent:child",
     requesterSessionKey: "agent:main:main",
@@ -109,7 +175,12 @@ export function createSubagentRunRecord(overrides: SubagentRunRecordOverrides): 
     task: overrides.runId,
     cleanup: "keep",
     createdAt: Date.now(),
-    ...overrides,
+    ...record,
+    execution:
+      execution ??
+      (typeof endedAt === "number"
+        ? { status: "terminal", startedAt, endedAt, outcome }
+        : { status: "running", startedAt }),
   } as SubagentRunRecord;
 }
 
@@ -189,7 +260,7 @@ export function expectDeliveryPath(
   value: unknown,
   path: "direct" | "none" | "queued" | "steered",
 ): Record<string, unknown> {
-  return expectRecordFields(value, { delivered: true, path }, "delivery");
+  return expectRecordFields(value, { delivered: path !== "queued", path }, "delivery");
 }
 
 export function mockCallArg(
@@ -204,4 +275,21 @@ export function mockCallArg(
     throw new Error(`expected ${label} call ${callIndex}`);
   }
   return call[argIndex] as Record<string, unknown>;
+}
+
+type SubagentRegistryModule =
+  typeof import("./subagents/registry/subagent-registry.test-helpers.js");
+export type SubagentRegistryHarness = Omit<SubagentRegistryModule, "registerSubagentRun"> & {
+  registerSubagentRun(
+    params: SubagentRunParamsOverrides,
+  ): ReturnType<SubagentRegistryModule["registerSubagentRun"]>;
+};
+
+export function createSubagentRegistryHarness(
+  registry: SubagentRegistryModule,
+): SubagentRegistryHarness {
+  return {
+    ...registry,
+    registerSubagentRun: (params) => registry.registerSubagentRun(createSubagentRunParams(params)),
+  };
 }

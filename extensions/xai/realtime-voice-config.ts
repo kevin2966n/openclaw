@@ -1,17 +1,15 @@
-import {
-  isProviderAuthProfileConfigured,
-  type OpenClawConfig,
-} from "openclaw/plugin-sdk/provider-auth";
-import { resolveApiKeyForProvider } from "openclaw/plugin-sdk/provider-auth-runtime";
 import type {
+  OpenAICompatibleRealtimeAudioFormat,
   RealtimeVoiceBridgeCreateRequest,
   RealtimeVoiceProviderConfig,
 } from "openclaw/plugin-sdk/realtime-voice";
 import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
 import {
-  asFiniteNumber,
+  asFiniteNumberInRange,
+  asOptionalObjectRecord as readXaiObjectRecord,
+  asSafeIntegerInRange,
   normalizeOptionalString,
-  parseBooleanValue as readBoolean,
+  parseBooleanValue,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { XAI_BASE_URL } from "./model-definitions.js";
 
@@ -31,17 +29,21 @@ type XaiRealtimeVoiceProviderConfig = {
   sessionResumption?: boolean;
 };
 
-export type XaiRealtimeVoiceBridgeConfig = RealtimeVoiceBridgeCreateRequest & {
-  apiKey?: string;
-  baseUrl: string;
-  model?: string;
-  voice?: string;
-  vadThreshold?: number;
-  silenceDurationMs?: number;
-  prefixPaddingMs?: number;
-  reasoningEffort?: XaiRealtimeReasoningEffort;
-  sessionResumption?: boolean;
-  resolveApiKey?: () => Promise<string>;
+export type XaiRealtimeVoiceBridgeConfig = RealtimeVoiceBridgeCreateRequest &
+  Omit<XaiRealtimeVoiceProviderConfig, "interruptResponseOnInputAudio"> & {
+    baseUrl: string;
+    resolveApiKey?: () => Promise<string>;
+  };
+
+type XaiRealtimeResponseItem = {
+  id?: string;
+  type?: string;
+  status?: "completed" | "incomplete" | "in_progress";
+  role?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+  content?: Array<{ type?: string; text?: string; transcript?: string }>;
 };
 
 export type XaiRealtimeEvent = {
@@ -59,21 +61,12 @@ export type XaiRealtimeEvent = {
     id?: string;
     status?: string;
     status_details?: unknown;
+    output?: XaiRealtimeResponseItem[];
   };
   conversation?: { id?: string };
-  item?: {
-    id?: string;
-    type?: string;
-    call_id?: string;
-    name?: string;
-    arguments?: string;
-  };
+  item?: XaiRealtimeResponseItem;
   error?: unknown;
 };
-
-export type XaiRealtimeAudioFormatConfig =
-  | { type: "audio/pcm"; rate: 24000 }
-  | { type: "audio/pcmu" };
 
 export type XaiRealtimeSessionUpdate = {
   type: "session.update";
@@ -89,10 +82,10 @@ export type XaiRealtimeSessionUpdate = {
     };
     audio: {
       input: {
-        format: XaiRealtimeAudioFormatConfig;
+        format: OpenAICompatibleRealtimeAudioFormat;
         transcription: { model: string };
       };
-      output: { format: XaiRealtimeAudioFormatConfig };
+      output: { format: OpenAICompatibleRealtimeAudioFormat };
     };
     reasoning?: { effort: XaiRealtimeReasoningEffort };
     resumption?: { enabled: boolean };
@@ -108,6 +101,7 @@ export const XAI_REALTIME_MAX_RECONNECT_ATTEMPTS = 5;
 export const XAI_REALTIME_BASE_RECONNECT_DELAY_MS = 1000;
 export const XAI_REALTIME_MAX_PENDING_TOOL_RESULTS = 128;
 export const XAI_REALTIME_MAX_PENDING_USER_MESSAGES = 128;
+export const XAI_REALTIME_MAX_PENDING_PLAYBACK_MARKS = 1_024;
 export const XAI_REALTIME_DEFAULT_VAD_THRESHOLD = 0.85;
 export const XAI_REALTIME_DEFAULT_PREFIX_PADDING_MS = 333;
 export const XAI_REALTIME_DEFAULT_SILENCE_DURATION_MS = 500;
@@ -117,7 +111,7 @@ export const XAI_REALTIME_ACTIVE_RESPONSE_ERROR_PREFIX =
 export const XAI_REALTIME_NO_ACTIVE_RESPONSE_CANCEL_ERROR =
   "Cancellation failed: no active response found";
 
-const XAI_REALTIME_VOICES = [
+export const XAI_REALTIME_VOICES = [
   "eve",
   "ara",
   "rex",
@@ -125,14 +119,23 @@ const XAI_REALTIME_VOICES = [
   "leo",
 ] as const satisfies readonly XaiRealtimeVoice[];
 
-function readRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+export function serializeXaiRealtimeToolResult(result: unknown): string {
+  const message = "xAI realtime voice tool result is not JSON-serializable";
+  try {
+    const serialized = JSON.stringify(result);
+    if (typeof serialized === "string") {
+      return serialized;
+    }
+  } catch (cause) {
+    throw new Error(message, { cause });
+  }
+  throw new Error(message);
 }
 
 function readNestedXaiConfig(rawConfig: RealtimeVoiceProviderConfig) {
-  const raw = readRecord(rawConfig);
-  const providers = readRecord(raw?.providers);
-  return readRecord(providers?.xai ?? raw?.xai ?? raw) ?? {};
+  const raw = readXaiObjectRecord(rawConfig);
+  const providers = readXaiObjectRecord(raw?.providers);
+  return readXaiObjectRecord(providers?.xai ?? raw?.xai ?? raw) ?? {};
 }
 
 export function normalizeXaiRealtimeBaseUrl(value?: string): string {
@@ -150,16 +153,8 @@ function normalizeXaiRealtimeVoice(value: unknown): string | undefined {
     : normalized;
 }
 
-function asXaiVadThreshold(value: unknown): number | undefined {
-  const number = asFiniteNumber(value);
-  return number !== undefined && number >= 0.1 && number <= 0.9 ? number : undefined;
-}
-
 function asXaiDurationMs(value: unknown): number | undefined {
-  const number = asFiniteNumber(value);
-  return number !== undefined && Number.isSafeInteger(number) && number >= 0 && number <= 10_000
-    ? number
-    : undefined;
+  return asSafeIntegerInRange(value, { min: 0, max: 10_000 });
 }
 
 function asXaiReasoningEffort(value: unknown): XaiRealtimeReasoningEffort | undefined {
@@ -185,12 +180,12 @@ export function normalizeXaiRealtimeProviderConfig(
     baseUrl: normalizeOptionalString(raw.baseUrl),
     model: normalizeOptionalString(raw.model),
     voice: normalizeXaiRealtimeVoice(raw.speakerVoice ?? raw.voice),
-    vadThreshold: asXaiVadThreshold(raw.vadThreshold),
+    vadThreshold: asFiniteNumberInRange(raw.vadThreshold, { min: 0.1, max: 0.9 }),
     silenceDurationMs: asXaiDurationMs(raw.silenceDurationMs),
     prefixPaddingMs: asXaiDurationMs(raw.prefixPaddingMs),
-    interruptResponseOnInputAudio: readBoolean(raw.interruptResponseOnInputAudio),
+    interruptResponseOnInputAudio: parseBooleanValue(raw.interruptResponseOnInputAudio),
     reasoningEffort: asXaiReasoningEffort(raw.reasoningEffort),
-    sessionResumption: readBoolean(raw.sessionResumption),
+    sessionResumption: parseBooleanValue(raw.sessionResumption),
   };
 }
 
@@ -198,7 +193,7 @@ export function readXaiRealtimeErrorDetail(error: unknown): string {
   if (typeof error === "string" && error) {
     return error;
   }
-  const record = readRecord(error);
+  const record = readXaiObjectRecord(error);
   return (
     normalizeOptionalString(record?.message) ??
     normalizeOptionalString(record?.code) ??
@@ -219,33 +214,4 @@ export function toXaiRealtimeWsUrl(
     url.searchParams.set("conversation_id", conversationId);
   }
   return url.toString();
-}
-
-export async function resolveXaiRealtimeApiKey(
-  configApiKey: string | undefined,
-  cfg: OpenClawConfig | undefined,
-): Promise<string> {
-  const direct =
-    normalizeOptionalString(configApiKey) ?? normalizeOptionalString(process.env.XAI_API_KEY);
-  if (direct) {
-    return direct;
-  }
-  const auth = await resolveApiKeyForProvider({ provider: "xai", cfg });
-  const oauthKey = normalizeOptionalString(auth?.apiKey);
-  if (oauthKey) {
-    return oauthKey;
-  }
-  throw new Error(
-    "xAI credentials missing for realtime voice. Sign in with `openclaw onboard --auth-choice xai-oauth`, run `openclaw onboard --auth-choice xai-api-key`, or set XAI_API_KEY.",
-  );
-}
-
-export function hasXaiRealtimeApiKeyInput(
-  configApiKey: string | undefined,
-  cfg: OpenClawConfig | undefined,
-): boolean {
-  if (normalizeOptionalString(configApiKey) || normalizeOptionalString(process.env.XAI_API_KEY)) {
-    return true;
-  }
-  return isProviderAuthProfileConfigured({ provider: "xai", cfg });
 }

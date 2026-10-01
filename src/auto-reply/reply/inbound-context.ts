@@ -9,32 +9,25 @@ import {
   stripLegacyMediaContextFields,
   type LegacyMediaContextKey,
 } from "../../media/media-facts.js";
-import { resolveCommandTurnContext } from "../command-turn-context.js";
+import { createCommandTurnContext, resolveCommandTurnContext } from "../command-turn-context.js";
+import { normalizeInternalTurnContext } from "../internal-turn-source.js";
 import type {
   CanonicalInboundText,
   FinalizedMsgContext,
   FinalizedRuntimeMsgContext,
   MsgContext,
 } from "../templating.js";
-import { normalizeInboundTextNewlines, sanitizeInboundSystemTags } from "./inbound-text.js";
+import { normalizeInboundTextNewlines } from "./inbound-text.js";
 
 export type FinalizeInboundContextOptions = {
   forceBodyForAgent?: boolean;
   forceBodyForCommands?: boolean;
   forceChatType?: boolean;
-  forceConversationLabel?: boolean;
 };
 
 const FINALIZED_INBOUND_CONTEXT = Symbol("openclaw.finalizedInboundContext");
 
 function normalizeTextField(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  return sanitizeInboundSystemTags(normalizeInboundTextNewlines(value));
-}
-
-function normalizeTrustedTextField(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
@@ -48,15 +41,12 @@ export function isFinalizedInboundContext<T extends Record<string, unknown>>(
 }
 
 function resolveCanonicalInboundText(
-  ctx: Record<string, unknown>,
+  ctx: MsgContext & { BodyStripped?: unknown },
   opts: Pick<FinalizeInboundContextOptions, "forceBodyForAgent" | "forceBodyForCommands"> = {},
 ): CanonicalInboundText {
-  const body = normalizeTextField(ctx.Body) ?? "";
+  const body = ctx.Body ?? "";
   const rawTextFromAliases =
-    normalizeTextField(ctx.RawBody) ??
-    normalizeTextField(ctx.Transcript) ??
-    normalizeTextField(ctx.BodyStripped) ??
-    body;
+    ctx.RawBody ?? ctx.Transcript ?? normalizeTextField(ctx.BodyStripped) ?? body;
   const forceTextProjection = opts.forceBodyForAgent || opts.forceBodyForCommands;
   const rawText = forceTextProjection
     ? rawTextFromAliases
@@ -65,15 +55,34 @@ function resolveCanonicalInboundText(
     ? body
     : (normalizeTextField(ctx.agentText) ??
       normalizeTextField(ctx.BodyForAgent) ??
-      normalizeTextField(ctx.CommandBody) ??
+      ctx.CommandBody ??
       rawText);
   const commandText = opts.forceBodyForCommands
-    ? (normalizeTextField(ctx.CommandBody) ?? rawText)
+    ? (ctx.CommandBody ?? rawText)
     : (normalizeTextField(ctx.commandText) ??
       normalizeTextField(ctx.BodyForCommands) ??
-      normalizeTextField(ctx.CommandBody) ??
+      ctx.CommandBody ??
       rawText);
-  return { commandText, agentText, rawText };
+  // Literal input has no executable projection, including before command handlers
+  // run or when media enrichment forces text projection again.
+  return {
+    commandText: ctx.CommandInterpretationSuppressed === true ? "" : commandText,
+    agentText,
+    rawText,
+  };
+}
+
+function foldDeprecatedPromptContextFields(ctx: MsgContext): void {
+  // Deprecated SDK field names fold here so third-party channel plugins keep working.
+  // Runtime reads only the channel-named fields; remove this with the deprecated fields.
+  if (ctx.ChannelPromptContext === undefined && ctx.UntrustedContext !== undefined) {
+    ctx.ChannelPromptContext = ctx.UntrustedContext;
+  }
+  delete ctx.UntrustedContext;
+  if (ctx.ChannelStructuredContext === undefined && ctx.UntrustedStructuredContext !== undefined) {
+    ctx.ChannelStructuredContext = ctx.UntrustedStructuredContext;
+  }
+  delete ctx.UntrustedStructuredContext;
 }
 
 function applySupplementalContext(ctx: MsgContext): void {
@@ -81,6 +90,14 @@ function applySupplementalContext(ctx: MsgContext): void {
   if (!supplemental) {
     return;
   }
+  if (
+    supplemental.channelStructuredContext === undefined &&
+    supplemental.untrustedContext !== undefined
+  ) {
+    // Fold the deprecated supplemental SDK key before projecting the canonical context shape.
+    supplemental.channelStructuredContext = supplemental.untrustedContext;
+  }
+  delete supplemental.untrustedContext;
   const fields = {
     ReplyToId: supplemental.quote?.id,
     ReplyToIdFull: supplemental.quote?.fullId,
@@ -95,7 +112,7 @@ function applySupplementalContext(ctx: MsgContext): void {
     ThreadHistoryBody: supplemental.thread?.historyBody,
     ThreadLabel: supplemental.thread?.label,
     GroupSystemPrompt: supplemental.groupSystemPrompt,
-    UntrustedStructuredContext: supplemental.untrustedContext,
+    ChannelStructuredContext: supplemental.channelStructuredContext,
   };
   for (const [key, value] of Object.entries(fields)) {
     if (value !== undefined && ctx[key as keyof MsgContext] === undefined) {
@@ -111,22 +128,21 @@ function finalizeInboundContextImpl<T extends Record<string, unknown>>(
   preserveLegacyMedia: boolean,
 ): T & FinalizedMsgContext {
   const normalized = ctx as T & MsgContext;
+  normalizeInternalTurnContext(normalized);
+  foldDeprecatedPromptContextFields(normalized);
   applySupplementalContext(normalized);
 
-  normalized.Body = sanitizeInboundSystemTags(
-    normalizeInboundTextNewlines(typeof normalized.Body === "string" ? normalized.Body : ""),
-  );
+  normalized.Body = normalizeTextField(normalized.Body) ?? "";
   normalized.RawBody = normalizeTextField(normalized.RawBody);
   normalized.CommandBody = normalizeTextField(normalized.CommandBody);
   normalized.Transcript = normalizeTextField(normalized.Transcript);
   normalized.ThreadStarterBody = normalizeTextField(normalized.ThreadStarterBody);
   normalized.ThreadHistoryBody = normalizeTextField(normalized.ThreadHistoryBody);
-  normalized.GroupSystemPrompt = normalizeTrustedTextField(normalized.GroupSystemPrompt);
-  if (Array.isArray(normalized.UntrustedContext)) {
-    const normalizedUntrusted = normalized.UntrustedContext.map((entry) =>
-      sanitizeInboundSystemTags(normalizeInboundTextNewlines(entry)),
-    ).filter((entry) => Boolean(entry));
-    normalized.UntrustedContext = normalizedUntrusted;
+  normalized.GroupSystemPrompt = normalizeTextField(normalized.GroupSystemPrompt);
+  if (Array.isArray(normalized.ChannelPromptContext)) {
+    normalized.ChannelPromptContext = normalized.ChannelPromptContext.map(
+      normalizeTextField,
+    ).filter((entry): entry is string => Boolean(entry));
   }
 
   const chatType = normalizeChatType(normalized.ChatType);
@@ -139,19 +155,19 @@ function finalizeInboundContextImpl<T extends Record<string, unknown>>(
   normalized.BodyForAgent = normalized.agentText;
   normalized.BodyForCommands = normalized.commandText;
 
-  const explicitLabel = normalizeOptionalString(normalized.ConversationLabel);
-  if (opts.forceConversationLabel || !explicitLabel) {
-    const resolved = normalizeOptionalString(resolveConversationLabel(normalized));
-    if (resolved) {
-      normalized.ConversationLabel = resolved;
-    }
-  } else {
-    normalized.ConversationLabel = explicitLabel;
+  const label =
+    normalizeOptionalString(normalized.ConversationLabel) ??
+    normalizeOptionalString(resolveConversationLabel(normalized));
+  if (label) {
+    normalized.ConversationLabel = label;
   }
 
   // Always set. Default-deny when upstream forgets to populate it.
-  normalized.CommandAuthorized = normalized.CommandAuthorized === true;
-  normalized.CommandTurn = resolveCommandTurnContext(normalized);
+  const suppressCommands = normalized.CommandInterpretationSuppressed === true;
+  normalized.CommandAuthorized = !suppressCommands && normalized.CommandAuthorized === true;
+  normalized.CommandTurn = suppressCommands
+    ? createCommandTurnContext("message", { authorized: false, body: "" })
+    : resolveCommandTurnContext(normalized);
   if (normalized.CommandTurn.source === "native" || normalized.CommandTurn.source === "text") {
     normalized.CommandSource = normalized.CommandTurn.source;
     normalized.CommandAuthorized = normalized.CommandTurn.authorized;

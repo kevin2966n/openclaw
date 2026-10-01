@@ -1,10 +1,14 @@
-// Interactive payload helpers normalize structured interactive UI payloads.
 import { asOptionalRecord as toRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { isWellFormedApprovalId } from "../../packages/gateway-protocol/src/schema/approval-id.js";
+import type { ChannelApprovalKind } from "../infra/approval-types.js";
+
+const PRESENTATION_FALLBACK_CONTINUATION = Symbol.for(
+  "openclaw.presentation.fallback-continuation",
+);
 
 export type InteractiveButtonStyle = "primary" | "secondary" | "success" | "danger";
 
@@ -13,6 +17,57 @@ export type MessagePresentationTone = "info" | "success" | "warning" | "danger" 
 
 /** Button style hint for renderers that support styled actions. */
 export type MessagePresentationButtonStyle = InteractiveButtonStyle;
+
+type QuestionPresentationAction =
+  | {
+      /** Resolve one declared choice. */
+      type: "question";
+      questionId: string;
+      optionValue: string;
+    }
+  | {
+      /** Switch this question to its free-text answer path. */
+      type: "question";
+      questionId: string;
+      intent: "custom-input";
+    };
+
+/** Core-owned model-picker action; channels serialize it only inside private envelopes. */
+export type ModelPickerAction = (
+  | {
+      intent: "show-providers";
+      cursor?: string;
+    }
+  | {
+      intent: "show-models";
+      providerToken: string;
+      cursor?: string;
+    }
+  | {
+      intent: "show-recents";
+      cursor?: string;
+    }
+  | {
+      intent: "choose-model";
+      providerToken: string;
+      modelToken: string;
+    }
+  | {
+      intent: "choose-runtime";
+      providerToken: string;
+      modelToken: string;
+      runtimeToken: string;
+    }
+  | { intent: "reset" }
+  | { intent: "cancel" }
+) & {
+  type: "model-picker";
+  version: 1;
+  snapshotToken: string;
+  /** Legacy command/callback payload fields are deliberately unavailable on picker actions. */
+  readonly command?: never;
+  readonly value?: never;
+};
 
 /** Portable typed action behind a button or select option. */
 export type MessagePresentationAction =
@@ -26,19 +81,15 @@ export type MessagePresentationAction =
       type: "callback";
       value: string;
     }
+  | ModelPickerAction
   | {
       /** Resolve one durable operator approval without exposing transport callback data. */
       type: "approval";
       approvalId: string;
-      approvalKind: "exec" | "plugin";
+      approvalKind: ChannelApprovalKind;
       decision: "allow-once" | "allow-always" | "deny";
     }
-  | {
-      /** Resolve one runtime-authored operator question choice. */
-      type: "question";
-      questionId: string;
-      optionValue: string;
-    }
+  | QuestionPresentationAction
   | {
       /** Open a normal external link. */
       type: "url";
@@ -60,6 +111,8 @@ export type MessagePresentationAction =
       /** OpenClaw hosted-widget ID whose launch mechanics are owned by the channel. */
       widgetId: string;
     };
+
+type LegacyMessagePresentationAction = Exclude<MessagePresentationAction, ModelPickerAction>;
 
 /** Portable action control rendered as a button or link by channel adapters. */
 export type MessagePresentationButton = {
@@ -100,7 +153,7 @@ export type MessagePresentationOption = {
   /** User-visible option label. */
   label: string;
   /** Typed action sent when the option is selected. */
-  action?: Extract<MessagePresentationAction, { type: "command" | "callback" }>;
+  action?: Extract<MessagePresentationAction, { type: "command" | "callback" | "model-picker" }>;
   /** @deprecated Use action. */
   value?: string;
 };
@@ -131,9 +184,18 @@ export function resolveMessagePresentationControlValue(control: {
 /** Resolve a canonical button action, including deprecated boundary inputs. */
 export function resolveMessagePresentationButtonAction(
   button: Pick<MessagePresentationButton, "action" | "url" | "value" | "webApp" | "web_app">,
+  options: { modelPicker: true },
+): MessagePresentationAction | undefined;
+export function resolveMessagePresentationButtonAction(
+  button: Pick<MessagePresentationButton, "action" | "url" | "value" | "webApp" | "web_app">,
+): LegacyMessagePresentationAction | undefined;
+export function resolveMessagePresentationButtonAction(
+  button: Pick<MessagePresentationButton, "action" | "url" | "value" | "webApp" | "web_app">,
+  options?: { modelPicker?: boolean },
 ): MessagePresentationAction | undefined {
   if (button.action !== undefined) {
-    return normalizePresentationAction(button.action);
+    const action = normalizePresentationAction(button.action);
+    return action?.type === "model-picker" && options?.modelPicker !== true ? undefined : action;
   }
   if (button.url) {
     return { type: "url", url: button.url };
@@ -148,10 +210,29 @@ export function resolveMessagePresentationButtonAction(
 /** Resolve a canonical select action, including the deprecated value input. */
 export function resolveMessagePresentationOptionAction(
   option: Pick<MessagePresentationOption, "action" | "value">,
-): Extract<MessagePresentationAction, { type: "command" | "callback" }> | undefined {
+  options: { modelPicker: true },
+):
+  | Extract<MessagePresentationAction, { type: "command" | "callback" | "model-picker" }>
+  | undefined;
+export function resolveMessagePresentationOptionAction(
+  option: Pick<MessagePresentationOption, "action" | "value">,
+): Extract<LegacyMessagePresentationAction, { type: "command" | "callback" }> | undefined;
+export function resolveMessagePresentationOptionAction(
+  option: Pick<MessagePresentationOption, "action" | "value">,
+  options?: { modelPicker?: boolean },
+):
+  | Extract<MessagePresentationAction, { type: "command" | "callback" | "model-picker" }>
+  | undefined {
   if (option.action !== undefined) {
     const action = normalizePresentationAction(option.action);
-    return action?.type === "command" || action?.type === "callback" ? action : undefined;
+    if (action?.type === "model-picker" && options?.modelPicker !== true) {
+      return undefined;
+    }
+    return action?.type === "command" ||
+      action?.type === "callback" ||
+      action?.type === "model-picker"
+      ? action
+      : undefined;
   }
   return option.value ? { type: "callback", value: option.value } : undefined;
 }
@@ -334,6 +415,93 @@ function normalizePresentationTone(value: unknown): MessagePresentationTone | un
     : undefined;
 }
 
+const MODEL_PICKER_TOKEN_MAX_LENGTH = 128;
+const MODEL_PICKER_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/u;
+
+function normalizeModelPickerToken(value: unknown): string | undefined {
+  const token = normalizeOptionalString(value);
+  return token &&
+    token.length <= MODEL_PICKER_TOKEN_MAX_LENGTH &&
+    MODEL_PICKER_TOKEN_PATTERN.test(token)
+    ? token
+    : undefined;
+}
+
+function normalizeOptionalModelPickerCursor(
+  record: Record<string, unknown>,
+): { valid: true; cursor?: string } | { valid: false } {
+  if (record.cursor === undefined) {
+    return { valid: true };
+  }
+  const cursor = normalizeModelPickerToken(record.cursor);
+  return cursor ? { valid: true, cursor } : { valid: false };
+}
+
+function normalizeModelPickerAction(
+  record: Record<string, unknown>,
+): ModelPickerAction | undefined {
+  if (record.type !== "model-picker" || record.version !== 1) {
+    return undefined;
+  }
+  const snapshotToken = normalizeModelPickerToken(record.snapshotToken);
+  if (!snapshotToken) {
+    return undefined;
+  }
+  const intent = record.intent;
+  if (intent === "show-providers" || intent === "show-recents") {
+    const cursor = normalizeOptionalModelPickerCursor(record);
+    return cursor.valid
+      ? {
+          type: "model-picker",
+          version: 1,
+          snapshotToken,
+          intent,
+          ...(cursor.cursor ? { cursor: cursor.cursor } : {}),
+        }
+      : undefined;
+  }
+  if (intent === "show-models") {
+    const providerToken = normalizeModelPickerToken(record.providerToken);
+    const cursor = normalizeOptionalModelPickerCursor(record);
+    return providerToken && cursor.valid
+      ? {
+          type: "model-picker",
+          version: 1,
+          snapshotToken,
+          intent,
+          providerToken,
+          ...(cursor.cursor ? { cursor: cursor.cursor } : {}),
+        }
+      : undefined;
+  }
+  if (intent === "choose-model") {
+    const providerToken = normalizeModelPickerToken(record.providerToken);
+    const modelToken = normalizeModelPickerToken(record.modelToken);
+    return providerToken && modelToken
+      ? { type: "model-picker", version: 1, snapshotToken, intent, providerToken, modelToken }
+      : undefined;
+  }
+  if (intent === "choose-runtime") {
+    const providerToken = normalizeModelPickerToken(record.providerToken);
+    const modelToken = normalizeModelPickerToken(record.modelToken);
+    const runtimeToken = normalizeModelPickerToken(record.runtimeToken);
+    return providerToken && modelToken && runtimeToken
+      ? {
+          type: "model-picker",
+          version: 1,
+          snapshotToken,
+          intent,
+          providerToken,
+          modelToken,
+          runtimeToken,
+        }
+      : undefined;
+  }
+  return intent === "reset" || intent === "cancel"
+    ? { type: "model-picker", version: 1, snapshotToken, intent }
+    : undefined;
+}
+
 function normalizePresentationAction(raw: unknown): MessagePresentationAction | undefined {
   const record = toRecord(raw);
   if (!record) {
@@ -348,6 +516,9 @@ function normalizePresentationAction(raw: unknown): MessagePresentationAction | 
     const value = normalizeOptionalString(record.value);
     return value ? { type: "callback", value } : undefined;
   }
+  if (type === "model-picker") {
+    return normalizeModelPickerAction(record);
+  }
   if (type === "approval") {
     if (record.type !== "approval") {
       return undefined;
@@ -358,7 +529,7 @@ function normalizePresentationAction(raw: unknown): MessagePresentationAction | 
     if (
       typeof approvalId !== "string" ||
       !isWellFormedApprovalId(approvalId) ||
-      (approvalKind !== "exec" && approvalKind !== "plugin") ||
+      (approvalKind !== "exec" && approvalKind !== "plugin" && approvalKind !== "system-agent") ||
       (decision !== "allow-once" && decision !== "allow-always" && decision !== "deny")
     ) {
       return undefined;
@@ -371,15 +542,19 @@ function normalizePresentationAction(raw: unknown): MessagePresentationAction | 
     }
     const questionId = record.questionId;
     const optionValue = record.optionValue;
-    if (
-      typeof questionId !== "string" ||
-      !isWellFormedApprovalId(questionId) ||
-      typeof optionValue !== "string" ||
-      !optionValue.trim()
-    ) {
+    if (typeof questionId !== "string" || !isWellFormedApprovalId(questionId)) {
       return undefined;
     }
-    return { type: "question", questionId, optionValue };
+    const intent = record.intent;
+    if (intent === undefined) {
+      return typeof optionValue === "string" && optionValue.trim()
+        ? { type: "question", questionId, optionValue }
+        : undefined;
+    }
+    if (intent === "custom-input") {
+      return { type: "question", questionId, intent };
+    }
+    return undefined;
   }
   if (type === "url") {
     const url = normalizeOptionalString(record.url);
@@ -445,7 +620,9 @@ function normalizeOption(raw: unknown): InteractiveReplyOption | undefined {
   const normalizedAction =
     record.action !== undefined ? normalizePresentationAction(record.action) : undefined;
   const action =
-    normalizedAction?.type === "command" || normalizedAction?.type === "callback"
+    normalizedAction?.type === "command" ||
+    normalizedAction?.type === "callback" ||
+    normalizedAction?.type === "model-picker"
       ? normalizedAction
       : undefined;
   if (!label || (record.action !== undefined && !action) || (!action && !value)) {
@@ -470,6 +647,13 @@ function normalizeInteractiveBlock(raw: unknown): InteractiveReplyBlock | undefi
     const text = normalizeOptionalString(record.text);
     return text ? { type: "text", text } : undefined;
   }
+  return normalizeInteractiveControls(record, type);
+}
+
+function normalizeInteractiveControls(
+  record: Record<string, unknown>,
+  type: string | undefined,
+): MessagePresentationInteractiveBlock | undefined {
   if (type === "buttons") {
     const buttons = normalizeList(record.buttons, normalizeButton);
     return buttons.length > 0 ? { type: "buttons", buttons } : undefined;
@@ -506,16 +690,15 @@ function normalizeChartSegments(value: unknown): MessagePresentationChartSegment
     : undefined;
 }
 
-function normalizeChartCategories(value: unknown): string[] | undefined {
+function normalizeUniqueLabels(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.length === 0) {
     return undefined;
   }
-  const categories = value.map((entry) => normalizeOptionalString(entry));
-  if (categories.some((entry) => !entry)) {
+  const labels = value.map((entry) => normalizeOptionalString(entry));
+  if (!labels.every((entry): entry is string => Boolean(entry))) {
     return undefined;
   }
-  const normalized = categories as string[];
-  return new Set(normalized).size === normalized.length ? normalized : undefined;
+  return new Set(labels).size === labels.length ? labels : undefined;
 }
 
 function normalizeChartSeries(params: {
@@ -563,7 +746,7 @@ function normalizeChartBlock(
   if (chartType !== "bar" && chartType !== "area" && chartType !== "line") {
     return undefined;
   }
-  const categories = normalizeChartCategories(record.categories);
+  const categories = normalizeUniqueLabels(record.categories);
   if (!categories) {
     return undefined;
   }
@@ -588,16 +771,8 @@ function normalizeTableBlock(
   record: Record<string, unknown>,
 ): MessagePresentationTableBlock | undefined {
   const caption = normalizeOptionalString(record.caption);
-  if (!caption || !Array.isArray(record.headers) || record.headers.length === 0) {
-    return undefined;
-  }
-  const headers = record.headers.map((header) => normalizeOptionalString(header));
-  if (
-    !headers.every((header): header is string => Boolean(header)) ||
-    new Set(headers).size !== headers.length ||
-    !Array.isArray(record.rows) ||
-    record.rows.length === 0
-  ) {
+  const headers = normalizeUniqueLabels(record.headers);
+  if (!caption || !headers || !Array.isArray(record.rows) || record.rows.length === 0) {
     return undefined;
   }
   const rows = record.rows.map((row) => {
@@ -648,32 +823,39 @@ export function normalizeLegacyInteractiveReply(raw: unknown): LegacyInteractive
 /** @deprecated Use normalizeMessagePresentation. */
 export const normalizeInteractiveReply = normalizeLegacyInteractiveReply;
 
-function normalizePresentationBlock(raw: unknown): MessagePresentationBlock | undefined {
+function isPresentationContinuation(raw: unknown): boolean {
+  const record = toRecord(raw);
+  return Boolean(
+    record &&
+    Object.getOwnPropertyDescriptor(record, PRESENTATION_FALLBACK_CONTINUATION)?.value === true,
+  );
+}
+
+function normalizePresentationBlock(
+  raw: unknown,
+  followedByContinuation: boolean,
+): MessagePresentationBlock | undefined {
   const record = toRecord(raw);
   if (!record) {
     return undefined;
   }
   const type = normalizeOptionalLowercaseString(record.type);
   if (type === "text" || type === "context") {
-    const text = normalizeOptionalString(record.text);
-    return text ? { type, text } : undefined;
+    const continuation = isPresentationContinuation(record);
+    // Adapted fragments share one authored paragraph; trimming either side loses
+    // whitespace at the split, and dropping the marker changes fallback layout.
+    const text =
+      (continuation || followedByContinuation) && typeof record.text === "string"
+        ? record.text
+        : normalizeOptionalString(record.text);
+    const block: MessagePresentationBlock | undefined = text ? { type, text } : undefined;
+    if (block && continuation) {
+      Object.defineProperty(block, PRESENTATION_FALLBACK_CONTINUATION, { value: true });
+    }
+    return block;
   }
   if (type === "divider") {
     return { type: "divider" };
-  }
-  if (type === "buttons") {
-    const buttons = normalizeList(record.buttons, normalizeButton);
-    return buttons.length > 0 ? { type: "buttons", buttons } : undefined;
-  }
-  if (type === "select") {
-    const options = normalizeList(record.options, normalizeOption);
-    return options.length > 0
-      ? {
-          type: "select",
-          placeholder: normalizeOptionalString(record.placeholder),
-          options,
-        }
-      : undefined;
   }
   if (type === "chart") {
     return normalizeChartBlock(record);
@@ -681,7 +863,7 @@ function normalizePresentationBlock(raw: unknown): MessagePresentationBlock | un
   if (type === "table") {
     return normalizeTableBlock(record);
   }
-  return undefined;
+  return normalizeInteractiveControls(record, type);
 }
 
 export function normalizeMessagePresentation(raw: unknown): MessagePresentation | undefined {
@@ -689,8 +871,18 @@ export function normalizeMessagePresentation(raw: unknown): MessagePresentation 
   if (!record) {
     return undefined;
   }
-  const blocks = normalizeList(record.blocks, normalizePresentationBlock);
-  const title = normalizeOptionalString(record.title);
+  const rawBlocks: unknown[] = Array.isArray(record.blocks) ? record.blocks : [];
+  const blocks = rawBlocks.flatMap((block, index) => {
+    const normalized = normalizePresentationBlock(
+      block,
+      isPresentationContinuation(rawBlocks[index + 1]),
+    );
+    return normalized ? [normalized] : [];
+  });
+  const title =
+    isPresentationContinuation(rawBlocks[0]) && typeof record.title === "string"
+      ? record.title
+      : normalizeOptionalString(record.title);
   if (!title && blocks.length === 0) {
     return undefined;
   }
@@ -731,7 +923,7 @@ export function presentationToInteractiveReply(
     }
     if (block.type === "buttons") {
       const buttons = block.buttons
-        .filter((button) => resolveMessagePresentationButtonAction(button))
+        .filter((button) => resolveMessagePresentationButtonAction(button, { modelPicker: true }))
         .map((button) => {
           const interactiveButton: InteractiveReplyButton = {
             label: button.label,
@@ -792,7 +984,7 @@ export function presentationToInteractiveReply(
             label: option.label,
           };
           if (option.action !== undefined) {
-            const action = resolveMessagePresentationOptionAction(option);
+            const action = resolveMessagePresentationOptionAction(option, { modelPicker: true });
             if (action) {
               interactiveOption.action = action;
               const actionValue = resolveMessagePresentationActionValue(action);
@@ -912,6 +1104,26 @@ export function renderMessagePresentationTableFallbackText(
   return lines.join("\n");
 }
 
+/** Keep only operator-visible navigation and public command text in control fallbacks. */
+export function renderMessagePresentationControlFallbackLabel(
+  control: Pick<
+    MessagePresentationButton,
+    "label" | "action" | "value" | "url" | "webApp" | "web_app" | "disabled"
+  >,
+): string {
+  if (control.disabled) {
+    return control.label;
+  }
+  const action = resolveMessagePresentationButtonAction(control);
+  if (action?.type === "url" || (action?.type === "web-app" && action.url)) {
+    return `${control.label}: ${action.url}`;
+  }
+  if (action?.type === "command") {
+    return `${control.label}: \`${action.command}\``;
+  }
+  return control.label;
+}
+
 export function renderMessagePresentationFallbackText(params: {
   presentation?: MessagePresentation;
   emptyFallback?: string | null;
@@ -931,24 +1143,17 @@ export function renderMessagePresentationFallbackText(params: {
   }
   for (const block of presentation.blocks) {
     if (block.type === "text" || block.type === "context") {
-      lines.push(block.text);
+      // Generated continuation blocks are bounded native fragments, not new paragraphs.
+      if (isPresentationContinuation(block) && lines.length) {
+        lines[lines.length - 1] += block.text;
+      } else {
+        lines.push(block.text);
+      }
       continue;
     }
     if (block.type === "buttons") {
       const labels = block.buttons
-        .map((button) => {
-          if (button.disabled) {
-            return button.label;
-          }
-          const action = resolveMessagePresentationButtonAction(button);
-          if (action?.type === "url" || (action?.type === "web-app" && action.url)) {
-            return `${button.label}: ${action.url}`;
-          }
-          if (action?.type === "command") {
-            return `${button.label}: \`${action.command}\``;
-          }
-          return button.label;
-        })
+        .map(renderMessagePresentationControlFallbackLabel)
         .filter(Boolean);
       if (labels.length > 0) {
         lines.push(labels.map((label) => `- ${label}`).join("\n"));
@@ -964,7 +1169,9 @@ export function renderMessagePresentationFallbackText(params: {
       continue;
     }
     if (block.type === "select") {
-      const labels = block.options.map((option) => option.label).filter(Boolean);
+      const labels = block.options
+        .map(renderMessagePresentationControlFallbackLabel)
+        .filter(Boolean);
       if (labels.length > 0) {
         const heading = block.placeholder ? `${block.placeholder}:` : "Options:";
         lines.push(`${heading}\n${labels.map((label) => `- ${label}`).join("\n")}`);

@@ -1,28 +1,27 @@
+import type { SessionRunStatus } from "../../../packages/gateway-protocol/src/schema/sessions-row.js";
+import type { ThemeCritterId } from "../../../packages/gateway-protocol/src/theme.ts";
+import { fnv1aUtf16 } from "../lib/fnv1a.ts";
+import { isSessionRunActive } from "../lib/session-run-state.ts";
+import type { LOBSTER_PALETTE_WEIGHTS } from "./lobster-pet-palettes.ts";
+
 export type LobsterPetMode = "idle" | "busy" | "offline";
 
 export type LobsterRunOutcome = "ok" | "error" | "aborted";
 
 export type LobsterPetPersonalityId = "sleepy" | "zoomy" | "friendly" | "showoff";
 
-export type LobsterPetPaletteId =
-  | "crimson"
-  | "coral"
-  | "teal"
-  | "violet"
-  | "ink"
-  | "blue"
-  | "gold"
-  | "calico"
-  | "abyss"
-  | "lumen"
-  | "ghost"
-  | "split"
-  | "cottoncandy"
-  | "retro";
+export type LobsterPetPaletteId = (typeof LOBSTER_PALETTE_WEIGHTS)[number][0]["id"];
 
 // Pass-through ledge visitors. Strangers are other lobsters; everyone else
 // is, at best, lobster-adjacent. None of them count for the Lobsterdex.
-export type LobsterPasserKind = "stranger" | "crab" | "snail" | "duck" | "jellyfish";
+export type LobsterPasserKind =
+  | "stranger"
+  | "crab"
+  | "snail"
+  | "duck"
+  | "jellyfish"
+  | ThemeCritterId
+  | (string & {});
 
 // How an arriving pet gets onto the ledge. Rolled per arrival from its own
 // seeded stream; "walk" is the classic pop-up from behind the ledge.
@@ -47,8 +46,6 @@ export type LobsterPetAccessory =
 
 export type LobsterPetAntennae = "perky" | "droopy";
 
-export type LobsterPetBuild = "round" | "squat" | "slender";
-
 export type LobsterPetClawSize = "dainty" | "regular" | "mighty";
 
 export type LobsterPetLook = {
@@ -61,7 +58,6 @@ export type LobsterPetLook = {
   facing: 1 | -1;
   personality: LobsterPetPersonalityId;
   blinkDelayS: number;
-  build: LobsterPetBuild;
   clawSize: LobsterPetClawSize;
   tailFan: boolean;
   // Pokemon-style shiny roll (~1 in 512): sparkles plus a saturated sheen,
@@ -74,6 +70,14 @@ export type LobsterPetLook = {
   // Seeded eye-glint tint for common palettes; rare palettes keep their
   // signature glints via CSS, and null keeps the default teal.
   glint: string | null;
+  // Chimera deliberately mixes four donor palettes. Other variants keep this
+  // null so palette swaps cannot accidentally leak mismatched part colors.
+  chimeraParts: {
+    body: string;
+    clawLeft: string;
+    clawRight: string;
+    antennae: string;
+  } | null;
 };
 
 // One salt per page load: revisiting the UI re-rolls every session's lobster,
@@ -89,7 +93,7 @@ export function lobsterPetSeed(sessionKey: string): number {
 export function resolveLobsterRunOutcome(
   sessions:
     | ReadonlyArray<{
-        status?: "running" | "done" | "failed" | "killed" | "timeout";
+        status?: SessionRunStatus;
         endedAt?: number | null;
         lastActivityAt?: number | null;
         updatedAt?: number | null;
@@ -120,11 +124,10 @@ export function resolveLobsterRunOutcome(
 
 export function resolveLobsterPetMode(
   connected: boolean,
-  sessions: ReadonlyArray<{ hasActiveRun?: boolean | null }> | null | undefined,
+  sessions: ReadonlyArray<{ hasActiveRun?: boolean; status?: SessionRunStatus }> | null | undefined,
 ): LobsterPetMode {
   if (!connected) {
     return "offline";
   }
-  return sessions?.some((row) => row.hasActiveRun === true) ? "busy" : "idle";
+  return sessions?.some(isSessionRunActive) ? "busy" : "idle";
 }
-import { fnv1aUtf16 } from "../lib/fnv1a.ts";

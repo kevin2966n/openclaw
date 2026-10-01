@@ -1,9 +1,10 @@
 // Voice Call API module exposes the plugin public contract.
 import { fetchWithSsrFGuard } from "../../../api.js";
+import type { GetCallStatusResult } from "../../types.js";
 import {
   cancelProviderResponseBody,
   readProviderErrorResponseSnippet,
-  readProviderJsonResponseText,
+  readVoiceCallProviderJsonResponse,
 } from "./response-body.js";
 
 // Shared guarded JSON API client for voice-call providers.
@@ -48,16 +49,24 @@ export async function guardedJsonApiRequest<T = unknown>(
       throw new Error(`${params.errorPrefix}: ${response.status} ${errorText}`);
     }
 
-    const text = await readProviderJsonResponseText(response);
-    if (!text) {
-      return undefined as T;
-    }
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      throw new Error(`${params.errorPrefix}: malformed JSON response`);
-    }
+    return (await readVoiceCallProviderJsonResponse<T>(
+      response,
+      `${params.errorPrefix}: malformed JSON response`,
+    )) as T;
   } finally {
     await release();
+  }
+}
+
+/** Failed carrier probes keep calls alive; an empty or missing response is terminal. */
+export async function readProviderCallStatus<T>(
+  request: () => Promise<T>,
+  describe: (data: NonNullable<T>) => GetCallStatusResult,
+): Promise<GetCallStatusResult> {
+  try {
+    const data = await request();
+    return data ? describe(data) : { status: "not-found", isTerminal: true };
+  } catch {
+    return { status: "error", isTerminal: false, isUnknown: true };
   }
 }

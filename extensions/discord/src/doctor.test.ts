@@ -159,10 +159,10 @@ describe("discord doctor", () => {
     ]);
   });
 
-  it("pins progress mode when migrating delivery-only aliases", () => {
+  it("keeps delivery-only aliases mode-free and preserves explicit legacy progress", () => {
     const normalize = getDiscordCompatibilityNormalizer();
 
-    const result = normalize({
+    const deliveryOnly = normalize({
       cfg: {
         channels: {
           discord: { blockStreaming: true },
@@ -170,17 +170,33 @@ describe("discord doctor", () => {
       } as never,
     });
 
-    const migrated = result.config.channels?.discord as Record<string, unknown>;
-    expect(migrated).toEqual({
+    const deliveryOnlyMigrated = deliveryOnly.config.channels?.discord as Record<string, unknown>;
+    expect(deliveryOnlyMigrated).toEqual({
+      streaming: { block: { enabled: true } },
+    });
+    expect(resolveDiscordPreviewStreamMode(deliveryOnlyMigrated)).toBe("off");
+    expect(deliveryOnly.changes).toEqual([
+      "Moved channels.discord.blockStreaming → channels.discord.streaming.block.enabled.",
+    ]);
+
+    const explicitProgress = normalize({
+      cfg: {
+        channels: {
+          discord: { streamMode: "progress", blockStreaming: true },
+        },
+      } as never,
+    });
+    const explicitProgressMigrated = explicitProgress.config.channels?.discord as Record<
+      string,
+      unknown
+    >;
+    expect(explicitProgressMigrated).toEqual({
       streaming: { mode: "progress", block: { enabled: true } },
     });
-    // Effective preview-mode parity: `streaming` absent resolved to progress
-    // before migration, so the migrated object must keep progress instead of
-    // falling to the object-without-mode default (off).
-    expect(resolveDiscordPreviewStreamMode(migrated)).toBe(resolveDiscordPreviewStreamMode({}));
-    expect(result.changes).toEqual([
+    expect(resolveDiscordPreviewStreamMode(explicitProgressMigrated)).toBe("progress");
+    expect(explicitProgress.changes).toEqual([
+      "Moved channels.discord.streamMode → channels.discord.streaming.mode (progress).",
       "Moved channels.discord.blockStreaming → channels.discord.streaming.block.enabled.",
-      "Set channels.discord.streaming.mode (progress) to keep the previous default while migrating flat streaming keys.",
     ]);
   });
 
@@ -216,43 +232,6 @@ describe("discord doctor", () => {
       "Moved channels.discord.accounts.work.chunkMode → channels.discord.accounts.work.streaming.chunkMode.",
       "Copied channels.discord.streaming into channels.discord.accounts.work.streaming to keep inherited settings while migrating flat streaming keys.",
     ]);
-  });
-
-  it("moves account voice.tts.edge into providers.microsoft", () => {
-    const normalize = getDiscordCompatibilityNormalizer();
-
-    const result = normalize({
-      cfg: {
-        channels: {
-          discord: {
-            accounts: {
-              main: {
-                voice: {
-                  tts: {
-                    edge: {
-                      voice: "en-US-JennyNeural",
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      } as never,
-    });
-
-    expect(result.changes).toContain(
-      "Moved channels.discord.accounts.main.voice.tts.edge → channels.discord.accounts.main.voice.tts.providers.microsoft.",
-    );
-    const mainTts = result.config.channels?.discord?.accounts?.main?.voice?.tts as
-      | Record<string, unknown>
-      | undefined;
-    expect(mainTts?.providers).toEqual({
-      microsoft: {
-        voice: "en-US-JennyNeural",
-      },
-    });
-    expect(mainTts?.edge).toBeUndefined();
   });
 
   it("does not move unsupported root and account tts provider aliases", () => {
@@ -672,5 +651,47 @@ describe("discord doctor", () => {
     } as unknown as OpenClawConfig;
 
     expect(collectDiscordMissingEnvTokenWarnings({ cfg, env: {} })).toStrictEqual([]);
+  });
+
+  it("warns when Discord transcript auto-start cannot choose between voice accounts", async () => {
+    const cfg = {
+      transcripts: {
+        autoStart: [
+          {
+            providerId: "discord-voice",
+            guildId: "guild-1",
+            channelId: "channel-1",
+          },
+          {
+            providerId: "discord-voice",
+            accountId: "alpha",
+            guildId: "guild-1",
+            channelId: "channel-2",
+          },
+          { providerId: "meeting", meetingUrl: "https://meet.example.test/standup" },
+        ],
+      },
+      channels: {
+        discord: {
+          accounts: {
+            alpha: { token: "alpha-token", voice: { enabled: true } },
+            bravo: { token: "bravo-token", voice: { enabled: true } },
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    const warnings =
+      (await discordDoctor.collectPreviewWarnings?.({
+        cfg,
+        doctorFixCommand: "openclaw doctor --fix",
+        env: {},
+      })) ?? [];
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("transcripts.autoStart[0]");
+    expect(warnings[0]).toContain("Multiple Discord accounts are enabled for voice");
+    expect(warnings[0]).toContain("transcripts.autoStart[0].accountId");
+    expect(warnings[0]).toContain("channels.discord.defaultAccount");
   });
 });

@@ -1,3 +1,4 @@
+import { createAgentHarnessAttemptLifecycle } from "openclaw/plugin-sdk/agent-harness-attempt-runtime";
 import {
   embeddedAgentLog,
   FAST_MODE_AUTO_PROGRESS_KIND,
@@ -5,22 +6,13 @@ import {
   formatFastModeAutoProgressText,
   resolveAgentRunAbortLifecycleFields,
   resolveFastModeForElapsed,
-  type EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import {
-  CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
-  interruptCodexTurnBestEffort,
-} from "./attempt-client-cleanup.js";
 import { reportCodexExecutionNotification } from "./attempt-notification-state.js";
 import {
   resolveTerminalDynamicToolBatchAction,
   shouldReleaseTurnAfterTerminalDynamicTool,
 } from "./dynamic-tool-execution.js";
-import type {
-  CodexDynamicToolCallParams,
-  CodexDynamicToolCallResponse,
-  CodexServerNotification,
-} from "./protocol.js";
+import type { CodexServerNotification } from "./protocol.js";
 import { buildCodexLifecycleTerminalMeta } from "./run-attempt-lifecycle-terminal.js";
 import { emitCodexAppServerEvent } from "./run-attempt-lifecycle.js";
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
@@ -30,7 +22,7 @@ export function createCodexAttemptLifecycleController(
   resources: CodexAttemptResources,
   turnRuntime: CodexAttemptTurnState,
 ) {
-  const { prompt, state: resourceState, trajectoryRecorder } = resources;
+  const { prompt, trajectoryRecorder } = resources;
   const { connection } = prompt.context.runtime;
   const {
     params,
@@ -39,13 +31,9 @@ export function createCodexAttemptLifecycleController(
     fastModeAutoStartedAtMs,
     fastModeAutoProgressState,
   } = connection;
-  const { state, activeTurnItemIds, pendingOpenClawDynamicToolCompletionIds, turnWatches } =
-    turnRuntime;
-  const releaseTurnAfterTerminalDynamicTool = (value: {
-    call: CodexDynamicToolCallParams;
-    response: CodexDynamicToolCallResponse;
-    durationMs: number;
-  }) => {
+  const { state, activeTurnItemIds, pendingOpenClawDynamicToolCompletionIds } = turnRuntime;
+  type TerminalToolRelease = NonNullable<typeof state.pendingTerminalDynamicToolRelease>;
+  const releaseTurnAfterTerminalDynamicTool = (value: TerminalToolRelease) => {
     if (
       !shouldReleaseTurnAfterTerminalDynamicTool({
         completed: state.completed,
@@ -78,16 +66,8 @@ export function createCodexAttemptLifecycleController(
     // Interrupt drops accepted pending input. Reject unconsumed steering first so
     // completion delivery can use its fallback path instead of reporting success.
     turnRuntime.steeringQueueRef.current?.cancel();
-    interruptCodexTurnBestEffort(resourceState.client, {
-      threadId: value.call.threadId,
-      turnId: value.call.turnId,
-      timeoutMs: CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
-    });
-    state.completed = true;
-    turnWatches.clearCompletionIdleTimer();
-    turnWatches.clearAssistantCompletionIdleTimer();
-    turnWatches.clearTerminalIdleTimer();
-    state.resolveCompletion?.();
+    void turnRuntime.interruptTurn(value.call.turnId, { locallyCompleted: true });
+    turnRuntime.completeTurn();
   };
   const scheduleTerminalDynamicToolReleaseCheck = () => {
     if (
@@ -128,36 +108,20 @@ export function createCodexAttemptLifecycleController(
     });
     immediate.unref?.();
   };
-  const scheduleTurnReleaseAfterTerminalDynamicTool = (value: {
-    call: CodexDynamicToolCallParams;
-    response: CodexDynamicToolCallResponse;
-    durationMs: number;
-  }) => {
+  const scheduleTurnReleaseAfterTerminalDynamicTool = (value: TerminalToolRelease) => {
     state.pendingTerminalDynamicToolRelease = value;
     scheduleTerminalDynamicToolReleaseCheck();
   };
-  const emitLifecycleStart = () => {
-    void emitCodexAppServerEvent(params, {
-      stream: "lifecycle",
-      data: { phase: "start", startedAt: attemptStartedAt },
+  const { emitLifecycleStart, emitLifecycleTerminal, emitExecutionPhaseOnce } =
+    createAgentHarnessAttemptLifecycle({
+      attempt: params,
+      backend: "codex-app-server",
+      startedAtMs: attemptStartedAt,
+      state,
+      emitEvent: (event) => emitCodexAppServerEvent(params, event),
+      shouldSuppressTerminal: () =>
+        Boolean(state.permissionChangeRestart || params.pluginRuntimeRefreshPending?.()),
     });
-    state.lifecycleStarted = true;
-  };
-  const emitLifecycleTerminal = (data: Record<string, unknown> & { phase: "end" | "error" }) => {
-    if (!state.lifecycleStarted || state.lifecycleTerminalEmitted) {
-      return;
-    }
-    void emitCodexAppServerEvent(params, {
-      stream: "lifecycle",
-      data: {
-        startedAt: attemptStartedAt,
-        endedAt: Date.now(),
-        ...data,
-        ...(params.deferTerminalLifecycle ? { phase: "finishing" } : {}),
-      },
-    });
-    state.lifecycleTerminalEmitted = true;
-  };
   const buildLifecycleTerminalMeta = (input: {
     aborted: boolean;
     timedOut: boolean;
@@ -169,22 +133,6 @@ export function createCodexAttemptLifecycleController(
     return buildCodexLifecycleTerminalMeta({
       ...input,
       abortStopReason: abortFields?.stopReason,
-    });
-  };
-  const executionPhaseKeys = new Set<string>();
-  const emitExecutionPhaseOnce = (
-    key: string,
-    info: Parameters<NonNullable<EmbeddedRunAttemptParams["onExecutionPhase"]>>[0],
-  ) => {
-    if (executionPhaseKeys.has(key)) {
-      return;
-    }
-    executionPhaseKeys.add(key);
-    params.onExecutionPhase?.({
-      provider: params.provider,
-      model: params.modelId,
-      backend: "codex-app-server",
-      ...info,
     });
   };
   const reportExecutionNotification = (notification: CodexServerNotification) => {
@@ -228,24 +176,21 @@ export function createCodexAttemptLifecycleController(
     fastModeAutoProgressState.offAnnounced = true;
     await emitFastModeAutoProgress(next);
   };
-  const maybeEmitFastModeAutoReset = async () => {
-    if (
-      params.fastModeAuto !== true ||
-      !fastModeAutoProgressState.offAnnounced ||
-      fastModeAutoProgressState.resetAnnounced
-    ) {
-      return;
-    }
-    fastModeAutoProgressState.resetAnnounced = true;
-    await emitFastModeAutoProgress({
-      enabled: true,
-      elapsedSeconds: 0,
-      fastAutoOnSeconds: params.fastModeAutoOnSeconds,
-    });
-  };
   const maybeEmitFastModeAutoResetBestEffort = async () => {
     try {
-      await maybeEmitFastModeAutoReset();
+      if (
+        params.fastModeAuto !== true ||
+        !fastModeAutoProgressState.offAnnounced ||
+        fastModeAutoProgressState.resetAnnounced
+      ) {
+        return;
+      }
+      fastModeAutoProgressState.resetAnnounced = true;
+      await emitFastModeAutoProgress({
+        enabled: true,
+        elapsedSeconds: 0,
+        fastAutoOnSeconds: params.fastModeAutoOnSeconds,
+      });
     } catch (error) {
       embeddedAgentLog.warn(
         `codex app-server fast mode auto reset progress failed: ${formatErrorMessage(error)}`,

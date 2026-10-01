@@ -4,15 +4,16 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { sanitizeSurrogates } from "@openclaw/ai/internal/shared";
+import { stableStringify } from "@openclaw/normalization-core";
 import { resolveStateDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isIncognitoSessionKey } from "../shared/incognito-session-key.js";
 import { resolveUserPath } from "../utils.js";
 import { parseBooleanValue } from "../utils/boolean.js";
 import { safeJsonStringify } from "../utils/safe-json.js";
 import { redactAgentDiagnosticPayload } from "./diagnostic-redaction.js";
 import { getQueuedFileWriter, type QueuedFileWriter } from "./queued-file-writer.js";
 import type { AgentMessage, StreamFn } from "./runtime/index.js";
-import { stableStringify } from "./stable-stringify.js";
 import { buildAgentTraceBase } from "./trace-base.js";
 
 // Payloads are redacted before JSONL output while stable digests preserve
@@ -40,24 +41,28 @@ type CacheTraceEvent = {
   modelId?: string;
   modelApi?: string | null;
   workspaceDir?: string;
-  prompt?: string;
+  prompt?: unknown;
   system?: unknown;
-  options?: Record<string, unknown>;
-  model?: Record<string, unknown>;
-  messages?: AgentMessage[];
+  options?: unknown;
+  model?: unknown;
+  messages?: unknown;
   messageCount?: number;
   messageRoles?: Array<string | undefined>;
   messageFingerprints?: string[];
   messagesDigest?: string;
   systemDigest?: string;
-  note?: string;
-  error?: string;
+  note?: unknown;
+  error?: unknown;
+};
+
+type CacheTracePayload = Partial<Omit<CacheTraceEvent, "messages">> & {
+  messages?: AgentMessage[];
 };
 
 type CacheTrace = {
   enabled: true;
   filePath: string;
-  recordStage: (stage: CacheTraceStage, payload?: Partial<CacheTraceEvent>) => void;
+  recordStage: (stage: CacheTraceStage, payload?: CacheTracePayload) => void;
   wrapStreamFn: (streamFn: StreamFn) => StreamFn;
 };
 
@@ -71,7 +76,7 @@ type CacheTraceInit = {
   modelId?: string;
   modelApi?: string | null;
   workspaceDir?: string;
-  writer?: CacheTraceWriter;
+  writer?: QueuedFileWriter;
 };
 
 type CacheTraceConfig = {
@@ -82,9 +87,7 @@ type CacheTraceConfig = {
   includeSystem: boolean;
 };
 
-type CacheTraceWriter = QueuedFileWriter;
-
-const writers = new Map<string, CacheTraceWriter>();
+const writers = new Map<string, QueuedFileWriter>();
 
 function resolveCacheTraceConfig(params: CacheTraceInit): CacheTraceConfig {
   const env = params.env ?? process.env;
@@ -109,10 +112,6 @@ function resolveCacheTraceConfig(params: CacheTraceInit): CacheTraceConfig {
   };
 }
 
-function getWriter(filePath: string): CacheTraceWriter {
-  return getQueuedFileWriter(writers, filePath);
-}
-
 function digest(value: unknown): string {
   const serialized = stableStringify(value, sanitizeSurrogates);
   return crypto.createHash("sha256").update(serialized).digest("hex");
@@ -126,7 +125,7 @@ function summarizeMessages(messages: AgentMessage[]): {
 } {
   // Hash each message and then the ordered fingerprint list so traces can detect
   // prompt drift without writing full messages when disabled.
-  const messageFingerprints = messages.map((msg) => digest(msg));
+  const messageFingerprints = messages.map(digest);
   return {
     messageCount: messages.length,
     messageRoles: messages.map((msg) => (msg as { role?: string }).role),
@@ -138,11 +137,11 @@ function summarizeMessages(messages: AgentMessage[]): {
 /** Create a cache trace recorder when diagnostics config/env enables it. */
 export function createCacheTrace(params: CacheTraceInit): CacheTrace | null {
   const cfg = resolveCacheTraceConfig(params);
-  if (!cfg.enabled) {
+  if (!cfg.enabled || isIncognitoSessionKey(params.sessionKey)) {
     return null;
   }
 
-  const writer = params.writer ?? getWriter(cfg.filePath);
+  const writer = params.writer ?? getQueuedFileWriter(writers, cfg.filePath);
   let seq = 0;
 
   const base: Omit<CacheTraceEvent, "ts" | "seq" | "stage"> = buildAgentTraceBase(params);
@@ -171,11 +170,7 @@ export function createCacheTrace(params: CacheTraceInit): CacheTrace | null {
 
     const messages = payload.messages;
     if (Array.isArray(messages)) {
-      const summary = summarizeMessages(messages);
-      event.messageCount = summary.messageCount;
-      event.messageRoles = summary.messageRoles;
-      event.messageFingerprints = summary.messageFingerprints;
-      event.messagesDigest = summary.messagesDigest;
+      Object.assign(event, summarizeMessages(messages));
       if (cfg.includeMessages) {
         // Full messages are optional; summaries/digests are always recorded when
         // message payloads are supplied.
@@ -197,26 +192,23 @@ export function createCacheTrace(params: CacheTraceInit): CacheTrace | null {
     writer.write(`${line}\n`);
   };
 
-  const wrapStreamFn: CacheTrace["wrapStreamFn"] = (streamFn) => {
-    const wrapped: StreamFn = (model, context, options) => {
-      const traceContext = context as {
-        messages?: AgentMessage[];
-        system?: unknown;
-        systemPrompt?: unknown;
-      };
-      recordStage("stream:context", {
-        model: {
-          id: model?.id,
-          provider: model?.provider,
-          api: model?.api,
-        },
-        system: traceContext.systemPrompt ?? traceContext.system,
-        messages: traceContext.messages ?? [],
-        options: (options ?? {}) as Record<string, unknown>,
-      });
-      return streamFn(model, context, options);
+  const wrapStreamFn: CacheTrace["wrapStreamFn"] = (streamFn) => (model, context, options) => {
+    const traceContext = context as {
+      messages?: AgentMessage[];
+      system?: unknown;
+      systemPrompt?: unknown;
     };
-    return wrapped;
+    recordStage("stream:context", {
+      model: {
+        id: model?.id,
+        provider: model?.provider,
+        api: model?.api,
+      },
+      system: traceContext.systemPrompt ?? traceContext.system,
+      messages: traceContext.messages ?? [],
+      options: (options ?? {}) as Record<string, unknown>,
+    });
+    return streamFn(model, context, options);
   };
 
   return {

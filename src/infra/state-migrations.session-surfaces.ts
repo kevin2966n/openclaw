@@ -1,29 +1,24 @@
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { listBundledChannelLegacySessionSurfaces } from "../channels/plugins/bundled.js";
+import type { PreparedLegacySessionSurfaces } from "../plugins/legacy-session-surfaces.types.js";
+import {
+  LEGACY_IMPLICIT_AGENT_ID as DEFAULT_AGENT_ID,
+  DEFAULT_MAIN_KEY,
+  isValidAgentId,
+  normalizeAgentId,
+  normalizeMainKey,
+  parseAgentSessionKey,
+} from "../routing/session-key.js";
 
-type LegacySessionSurface = {
-  isLegacyGroupSessionKey?: (key: string) => boolean;
-  canonicalizeLegacySessionKey?: (params: {
-    key: string;
-    agentId: string;
-  }) => string | null | undefined;
-};
-
-let cachedLegacySessionSurfaces: LegacySessionSurface[] | null = null;
-
-export function getLegacySessionSurfaces(): LegacySessionSurface[] {
-  // Legacy migrations run on cold doctor/startup paths. Prefer the narrower
-  // setup plugin surface here so session-key cleanup does not materialize full
-  // bundled channel runtimes.
-  cachedLegacySessionSurfaces ??= [...listBundledChannelLegacySessionSurfaces()];
-  return cachedLegacySessionSurfaces;
-}
+export type { PreparedLegacySessionSurfaces };
 
 export function isSurfaceGroupKey(key: string): boolean {
   return key.includes(":group:") || key.includes(":channel:");
 }
 
-export function isLegacyGroupKey(key: string): boolean {
+export function isLegacyGroupKey(
+  key: string,
+  surfaces: PreparedLegacySessionSurfaces["surfaces"] = [],
+): boolean {
   const trimmed = key.trim();
   if (!trimmed) {
     return false;
@@ -32,7 +27,7 @@ export function isLegacyGroupKey(key: string): boolean {
   if (lower.startsWith("group:") || lower.startsWith("channel:")) {
     return true;
   }
-  for (const surface of getLegacySessionSurfaces()) {
+  for (const surface of surfaces) {
     if (surface.isLegacyGroupSessionKey?.(trimmed)) {
       return true;
     }
@@ -40,6 +35,23 @@ export function isLegacyGroupKey(key: string): boolean {
   return false;
 }
 
-export function resetLegacySessionSurfacesForTest(): void {
-  cachedLegacySessionSurfaces = null;
+export function isLegacyDefaultMainAliasKey(key: string, mainKey: string): boolean {
+  const lower = normalizeLowercaseStringOrEmpty(key.trim());
+  const canonicalMainKey = normalizeMainKey(mainKey);
+  return (
+    lower === `agent:${DEFAULT_AGENT_ID}:${DEFAULT_MAIN_KEY}` ||
+    lower === `agent:${DEFAULT_AGENT_ID}:${canonicalMainKey}`
+  );
+}
+
+export function resolveCanonicalAgentSessionOwner(key: string): string | undefined {
+  const parsed = parseAgentSessionKey(key);
+  if (
+    parsed === null ||
+    !isValidAgentId(parsed.agentId) ||
+    normalizeAgentId(parsed.agentId) !== parsed.agentId
+  ) {
+    return undefined;
+  }
+  return parsed.agentId;
 }

@@ -1,7 +1,6 @@
 // Inbound event media tests cover channel media attachment normalization.
-import { kindFromMime } from "@openclaw/media-core/mime";
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { describe, expect, it } from "vitest";
+import path from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   hasStagedMediaFacts,
   normalizeMediaFacts,
@@ -19,112 +18,25 @@ import {
   formatInboundMediaUnavailableText,
   toHistoryMediaEntries,
   toInboundMediaFacts,
+  toInboundMediaFactsWithMetadata,
   type ChannelInboundMediaInput,
 } from "./media.js";
+
+const { probeMediaFilesWithinBudget } = vi.hoisted(() => ({
+  probeMediaFilesWithinBudget: vi.fn(),
+}));
+
+vi.mock("../../media/media-probe.js", () => ({ probeMediaFilesWithinBudget }));
+
+beforeEach(() => {
+  probeMediaFilesWithinBudget.mockReset();
+});
 
 type MergeMatrixSource = MediaFactLegacyProjection & {
   media?: readonly MediaFactInput[];
   MediaStaged?: boolean;
   MediaWorkspaceDir?: string;
 };
-
-const canonicalModes = ["none", "partial", "full"] as const;
-const legacyModes = [
-  "none",
-  "aligned",
-  "mismatched-cardinality",
-  "staged-MediaStaged",
-  "staged-MediaWorkspaceDir",
-  "scalar-only",
-] as const;
-const typeModes = ["present", "absent", "conflicting"] as const;
-
-function buildCanonicalMedia(
-  mode: (typeof canonicalModes)[number],
-  typeMode: (typeof typeModes)[number],
-): MediaFactInput[] {
-  if (mode === "none") {
-    return [];
-  }
-  if (mode === "partial") {
-    return [{ path: "/canonical/voice.ogg" }];
-  }
-  const typeFields =
-    typeMode === "present"
-      ? [{ contentType: "audio/ogg" }, { contentType: "image/jpeg" }]
-      : typeMode === "conflicting"
-        ? [
-            { contentType: "audio/ogg", kind: "video" as const },
-            { contentType: "image/jpeg", kind: "document" as const },
-          ]
-        : [{}, {}];
-  return [
-    {
-      path: "/canonical/voice.ogg",
-      url: "https://canonical.test/voice.ogg",
-      workspaceDir: "/canonical/workspace-a",
-      ...typeFields[0],
-    },
-    {
-      path: "/canonical/photo.jpg",
-      url: "https://canonical.test/photo.jpg",
-      workspaceDir: "/canonical/workspace-b",
-      ...typeFields[1],
-    },
-  ];
-}
-
-function buildLegacyMedia(
-  mode: (typeof legacyModes)[number],
-  typeMode: (typeof typeModes)[number],
-): MergeMatrixSource {
-  const base: MergeMatrixSource =
-    mode === "none"
-      ? {}
-      : mode === "scalar-only"
-        ? {
-            MediaPath: "/legacy/scalar.ogg",
-            MediaUrl: "/legacy/scalar.ogg",
-          }
-        : {
-            MediaPaths:
-              mode === "mismatched-cardinality" ? ["/legacy/voice.ogg"] : ["/legacy/voice.ogg", ""],
-            MediaUrls: ["/legacy/voice.ogg", "https://legacy.test/photo.jpg"],
-            ...(mode === "staged-MediaStaged" ? { MediaStaged: true } : {}),
-            ...(mode === "staged-MediaWorkspaceDir"
-              ? { MediaWorkspaceDir: "/tmp/staged-media" }
-              : {}),
-          };
-  if (typeMode === "absent" || mode === "none") {
-    return base;
-  }
-  if (mode === "scalar-only") {
-    return { ...base, MediaType: typeMode === "present" ? "audio/ogg" : "image/png" };
-  }
-  return {
-    ...base,
-    MediaType: typeMode === "conflicting" ? "video/mp4" : "audio/ogg",
-    MediaTypes:
-      typeMode === "present"
-        ? mode === "mismatched-cardinality"
-          ? ["audio/ogg", "image/jpeg", "application/pdf"]
-          : ["audio/ogg", "image/jpeg"]
-        : mode === "mismatched-cardinality"
-          ? ["image/png", "video/mp4", "application/pdf"]
-          : ["image/png", "video/mp4"],
-  };
-}
-
-const mediaMergeMatrix = canonicalModes.flatMap((canonicalMode) =>
-  legacyModes.flatMap((legacyMode) =>
-    typeModes.map((typeMode) => ({
-      name: `canonical=${canonicalMode} legacy=${legacyMode} types=${typeMode}`,
-      canonicalMode,
-      legacyMode,
-      typeMode,
-    })),
-  ),
-);
 
 const stagedMediaMergeMatrix: Array<{
   name: string;
@@ -303,6 +215,55 @@ const stagedMediaMergeMatrix: Array<{
 ];
 
 describe("channel inbound media facts", () => {
+  it("probes local audio and video facts without probing images or URL-only media", async () => {
+    probeMediaFilesWithinBudget.mockResolvedValueOnce([
+      { durationMs: 1500 },
+      { durationMs: 2500, width: 1280, height: 720 },
+    ]);
+
+    await expect(
+      toInboundMediaFactsWithMetadata([
+        { path: "/tmp/voice.ogg", contentType: "audio/ogg" },
+        { path: "/tmp/clip.mp4", kind: "video" },
+        { path: "/tmp/photo.png", contentType: "image/png" },
+        { url: "https://example.test/remote.mp3", contentType: "audio/mpeg" },
+      ]),
+    ).resolves.toEqual([
+      expect.objectContaining({ path: "/tmp/voice.ogg", durationMs: 1500 }),
+      expect.objectContaining({
+        path: "/tmp/clip.mp4",
+        durationMs: 2500,
+        width: 1280,
+        height: 720,
+      }),
+      expect.objectContaining({ path: "/tmp/photo.png" }),
+      expect.objectContaining({ url: "https://example.test/remote.mp3" }),
+    ]);
+    expect(probeMediaFilesWithinBudget).toHaveBeenCalledWith(
+      [
+        { filePath: path.resolve("/tmp/voice.ogg"), kind: "audio" },
+        { filePath: path.resolve("/tmp/clip.mp4"), kind: "video" },
+      ],
+      { budgetMs: 3000, concurrency: 2, maxProbes: 8 },
+    );
+  });
+
+  it("passes the full local candidate list to the bounded batch helper", async () => {
+    probeMediaFilesWithinBudget.mockImplementation(async (inputs: readonly unknown[]) =>
+      inputs.map((_, index) => (index < 8 ? { durationMs: 1000 } : {})),
+    );
+    const facts = await toInboundMediaFactsWithMetadata(
+      Array.from({ length: 10 }, (_, index) => ({
+        path: `/tmp/voice-${index}.ogg`,
+        contentType: "audio/ogg",
+      })),
+    );
+
+    expect(probeMediaFilesWithinBudget.mock.calls[0]?.[0]).toHaveLength(10);
+    expect(facts.slice(0, 8).every((fact) => fact.durationMs === 1000)).toBe(true);
+    expect(facts.slice(8).every((fact) => fact.durationMs === undefined)).toBe(true);
+  });
+
   it("formats media placeholder text with kind precedence and normalized MIME fallback", () => {
     expect(
       formatMediaPlaceholderText([
@@ -355,7 +316,12 @@ describe("channel inbound media facts", () => {
 
   it("normalizes provider media into inbound media facts", () => {
     const input = [
-      { path: " /tmp/image.png ", contentType: " image/png ", messageId: " " },
+      {
+        path: " /tmp/image.png ",
+        contentType: " image/png ",
+        fileName: " original image.png ",
+        messageId: " ",
+      },
       {
         url: "https://example.test/audio.mp3",
         contentType: "audio/mpeg",
@@ -373,6 +339,7 @@ describe("channel inbound media facts", () => {
         url: undefined,
         contentType: "image/png",
         kind: "image",
+        fileName: "original image.png",
         transcribed: false,
         messageId: "msg-1",
       },
@@ -468,59 +435,86 @@ describe("channel inbound media facts", () => {
     ]);
   });
 
-  it.each(mediaMergeMatrix)("merges $name", ({ canonicalMode, legacyMode, typeMode }) => {
-    const canonical = buildCanonicalMedia(canonicalMode, typeMode);
-    const legacy = buildLegacyMedia(legacyMode, typeMode);
-    const source: MergeMatrixSource = {
-      ...legacy,
-      ...(canonical.length > 0 ? { media: canonical } : {}),
-    };
-    const facts = resolveMediaFacts(source);
-    const paths = legacy.MediaPaths ?? [];
-    const urls = legacy.MediaUrls ?? [];
-    const types = legacy.MediaTypes ?? [];
-    const expectedCount = Math.max(
-      canonical.length,
-      paths.length,
-      urls.length,
-      types.length,
-      legacy.MediaPath || legacy.MediaUrl ? 1 : 0,
-    );
+  it("does not smear a singular legacy MediaUrl onto later slots after plural paths", () => {
+    const facts = resolveMediaFacts({
+      MediaPaths: ["/tmp/a.png", "/tmp/b.png"],
+      MediaUrls: ["file:///tmp/a.png"],
+      MediaUrl: "file:///tmp/a.png",
+    });
+    expect(facts).toHaveLength(2);
+    expect(facts[0]?.path).toBe("/tmp/a.png");
+    expect(facts[0]?.url).toBe("file:///tmp/a.png");
+    expect(facts[1]?.path).toBe("/tmp/b.png");
+    expect(facts[1]?.url).toBeUndefined();
+  });
 
-    const stageableFacts = facts.filter((fact) => Boolean(normalizeOptionalString(fact.path)));
-    expect(hasStagedMediaFacts(facts)).toBe(
-      stageableFacts.length > 0 &&
-        stageableFacts.every(
-          (fact) => Boolean(normalizeOptionalString(fact.workspaceDir)) || fact.staged === true,
-        ),
-    );
-    expect(facts).toHaveLength(expectedCount);
-    for (let index = 0; index < expectedCount; index += 1) {
-      const canonicalFact = canonical[index];
-      const expectedPath = normalizeOptionalString(
-        canonicalFact?.path ?? paths[index] ?? (index === 0 ? legacy.MediaPath : undefined),
-      );
-      const expectedUrl = normalizeOptionalString(
-        canonicalFact?.url ?? urls[index] ?? (index === 0 ? legacy.MediaUrl : undefined),
-      );
-      const expectedContentType = normalizeOptionalString(
-        canonicalFact?.contentType ??
-          types[index] ??
-          (expectedCount === 1 ? legacy.MediaType : undefined),
-      );
-      const expectedKind = canonicalFact?.kind ?? kindFromMime(expectedContentType);
-      const expectedWorkspaceDir = canonicalFact?.workspaceDir ?? legacy.MediaWorkspaceDir;
-      expect(facts[index]).toMatchObject({
-        path: expectedPath,
-        url: expectedUrl,
-        contentType: expectedContentType,
-        kind: expectedKind,
-        ...(expectedWorkspaceDir ? { workspaceDir: expectedWorkspaceDir } : {}),
-      });
-      if (!expectedWorkspaceDir) {
-        expect(facts[index]).not.toHaveProperty("workspaceDir");
-      }
-    }
+  it("keeps canonical facts ahead of conflicting legacy fields and preserves sparse alignment", () => {
+    const facts = resolveMediaFacts({
+      media: [
+        {
+          path: "/canonical/voice.ogg",
+          url: "https://canonical.test/voice.ogg",
+          contentType: "audio/ogg",
+          kind: "video",
+          workspaceDir: "/canonical/workspace",
+        },
+        { path: "/canonical/photo.jpg" },
+      ],
+      MediaPaths: ["/legacy/voice.ogg"],
+      MediaUrls: ["/legacy/voice.ogg", "https://legacy.test/photo.jpg"],
+      MediaTypes: ["image/png", "image/jpeg", "application/pdf"],
+      MediaType: "video/mp4",
+      MediaWorkspaceDir: "/legacy/workspace",
+      MediaStaged: true,
+    });
+
+    expect(facts).toEqual([
+      expect.objectContaining({
+        path: "/canonical/voice.ogg",
+        url: "https://canonical.test/voice.ogg",
+        contentType: "audio/ogg",
+        kind: "video",
+        workspaceDir: "/canonical/workspace",
+      }),
+      expect.objectContaining({
+        path: "/canonical/photo.jpg",
+        url: "https://legacy.test/photo.jpg",
+        contentType: "image/jpeg",
+        kind: "image",
+        workspaceDir: "/legacy/workspace",
+      }),
+      expect.objectContaining({
+        path: undefined,
+        url: undefined,
+        contentType: "application/pdf",
+        kind: "document",
+        workspaceDir: "/legacy/workspace",
+      }),
+    ]);
+    expect(facts.every((fact) => fact.staged === undefined)).toBe(true);
+    expect(hasStagedMediaFacts(facts)).toBe(true);
+  });
+
+  it.each([
+    [undefined, undefined],
+    ["audio/ogg", "audio"],
+    ["image/png", "image"],
+  ])("resolves scalar legacy media with content type %s", (MediaType, kind) => {
+    const facts = resolveMediaFacts({ MediaPath: "/legacy/scalar.ogg", MediaType });
+    expect(facts).toEqual([
+      expect.objectContaining({
+        path: "/legacy/scalar.ogg",
+        contentType: MediaType,
+        kind,
+      }),
+    ]);
+    expect(facts[0]).not.toHaveProperty("workspaceDir");
+    expect(hasStagedMediaFacts(facts)).toBe(false);
+  });
+
+  it("keeps absent media empty and unstaged", () => {
+    expect(resolveMediaFacts({})).toEqual([]);
+    expect(hasStagedMediaFacts([])).toBe(false);
   });
 
   it.each(stagedMediaMergeMatrix)("merges $name", ({ source, expected, expectedStaged }) => {

@@ -1,4 +1,4 @@
-// Tavily plugin module implements tavily search tool behavior.
+import { optionalStringEnum } from "openclaw/plugin-sdk/channel-actions";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-runtime";
 import {
   jsonResult,
@@ -9,7 +9,6 @@ import {
 import { Type } from "typebox";
 import { runTavilySearch } from "./tavily-client.js";
 import { resolveTavilyToolConfig, type TavilyToolConfigContext } from "./tavily-tool-config.js";
-import { optionalStringEnum } from "./tavily-tool-schema.js";
 
 const TavilySearchToolSchema = Type.Object(
   {
@@ -53,10 +52,16 @@ export function createTavilySearchTool(api: OpenClawPluginApi, ctx?: TavilyToolC
   return {
     name: "tavily_search",
     label: "Tavily Search",
+    resultContentSource: "network" as const,
     description:
       "Search the web using Tavily Search API. Supports search depth, topic filtering, domain filters, time ranges, and AI answer summaries.",
     parameters: TavilySearchToolSchema,
-    execute: async (_toolCallId: string, rawParams: Record<string, unknown>) => {
+    execute: async (
+      _toolCallId: string,
+      rawParams: Record<string, unknown>,
+      signal?: AbortSignal,
+    ) => {
+      signal?.throwIfAborted();
       const query = readStringParam(rawParams, "query", { required: true });
       const searchDepth = readStringParam(rawParams, "search_depth") || undefined;
       const topic = readStringParam(rawParams, "topic") || undefined;
@@ -80,6 +85,7 @@ export function createTavilySearchTool(api: OpenClawPluginApi, ctx?: TavilyToolC
           timeRange,
           includeDomains,
           excludeDomains,
+          ...(signal ? { signal } : {}),
         }),
       );
     },

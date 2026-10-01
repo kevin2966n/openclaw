@@ -1,4 +1,3 @@
-// Matrix plugin module implements room info behavior.
 import { isMatrixNotFoundError } from "../errors.js";
 import type { MatrixClient } from "../sdk.js";
 import { setBoundedMap } from "./bounded-cache.js";
@@ -25,8 +24,9 @@ export function createMatrixRoomInfoResolver(client: MatrixClient) {
   const getRoomName = async (
     roomId: string,
   ): Promise<Pick<MatrixRoomInfo, "name" | "nameResolved">> => {
-    if (roomNameCache.has(roomId)) {
-      return roomNameCache.get(roomId) ?? { nameResolved: false };
+    const cached = roomNameCache.get(roomId);
+    if (cached) {
+      return cached;
     }
     let name: string | undefined;
     let nameResolved = false;
@@ -94,21 +94,31 @@ export function createMatrixRoomInfoResolver(client: MatrixClient) {
 
   const getMemberDisplayName = async (roomId: string, userId: string): Promise<string> => {
     const cacheKey = `${roomId}:${userId}`;
-    if (memberDisplayNameCache.has(cacheKey)) {
-      return memberDisplayNameCache.get(cacheKey) ?? userId;
+    const cached = memberDisplayNameCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
     }
-    const memberState = await client
-      .getRoomStateEvent(roomId, "m.room.member", userId)
-      .catch(() => null);
+    let memberState: Record<string, unknown>;
+    try {
+      memberState = await client.getRoomStateEvent(roomId, "m.room.member", userId);
+    } catch {
+      // A transient homeserver failure is not authoritative room state; retry
+      // the next lookup instead of pinning the fallback user ID for the session.
+      return userId;
+    }
     const displayName =
       memberState && typeof memberState.displayname === "string" ? memberState.displayname : userId;
     setBoundedMap(memberDisplayNameCache, cacheKey, displayName, MAX_MEMBER_DISPLAY_NAMES);
     return displayName;
   };
 
+  const invalidateMemberDisplayName = (roomId: string, userId: string): void => {
+    memberDisplayNameCache.delete(`${roomId}:${userId}`);
+  };
+
   return {
-    getRoomAliases,
     getRoomInfo,
     getMemberDisplayName,
+    invalidateMemberDisplayName,
   };
 }
