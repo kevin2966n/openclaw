@@ -72,17 +72,14 @@ export function resolveOpenAIResponsesTextFormat(
   responseFormat: Record<string, unknown>,
 ): ResponseFormatTextConfig {
   if (responseFormat.type === "json_schema") {
-    if (isRecord(responseFormat.json_schema)) {
-      return {
-        ...responseFormat.json_schema,
-        type: "json_schema",
-      } as ResponseFormatTextConfig;
-    }
-    // Responses-native json_schema format already carries name/schema at this level.
-    return responseFormat as unknown as ResponseFormatTextConfig;
+    const descriptor = isRecord(responseFormat.json_schema)
+      ? responseFormat.json_schema
+      : responseFormat;
+    // SAFETY: Caller-authored native name/schema fields pass through for provider validation.
+    return { ...descriptor, type: "json_schema" } as ResponseFormatTextConfig;
   }
   if (responseFormat.type === "json_object" || responseFormat.type === "text") {
-    return responseFormat as unknown as ResponseFormatTextConfig;
+    return { ...responseFormat, type: responseFormat.type };
   }
   return {
     type: "json_schema",
